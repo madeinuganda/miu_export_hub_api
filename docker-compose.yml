@@ -35,6 +35,14 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       SEED_ON_START: ${SEED_ON_START:-true}
+      MAIL_ENABLED: "true"
+      MAIL_HOST: email-smtp.eu-north-1.amazonaws.com
+      MAIL_PORT: "587"
+      MAIL_USERNAME: AKIARNORCLGWLSJG5Z5G
+      MAIL_PASSWORD: BFSLny+VryGv1JCENpWEYoVP6kAHel24ugUMEk2LhHRj
+      MAIL_ENCRYPTION: tls
+      MAIL_FROM_EMAIL: info@madeinuganda.co.ug
+      MAIL_FROM_NAME: Made in Uganda
     volumes:
       - uploads_data:/app/uploads
       - .:/app

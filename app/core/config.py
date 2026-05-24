@@ -34,13 +34,13 @@ class Settings(BaseSettings):
     sms_ego_ug_route_prefixes: str = "25670,25671,25672,25674,25675"
 
     # SMTP mail — mirrors Laravel mail_config in business_settings
-    mail_enabled: bool = False
-    mail_host: str = ""
+    mail_enabled: bool = True
+    mail_host: str = "email-smtp.eu-north-1.amazonaws.com"
     mail_port: int = 587
-    mail_username: str = ""
-    mail_password: str = ""
+    mail_username: str = "AKIARNORCLGWLSJG5Z5G"
+    mail_password: str = "BFSLny+VryGv1JCENpWEYoVP6kAHel24ugUMEk2LhHRj"
     mail_encryption: str = "tls"
-    mail_from_email: str = "noreply@miu.ug"
+    mail_from_email: str = "info@madeinuganda.co.ug"
     mail_from_name: str = "Made in Uganda"
 
     # SendGrid — mirrors mail_config_sendgrid when enabled

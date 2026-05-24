@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "MIU Export Hub",
+      "Group": "Development",
+      "Host": "db",
+      "Port": 5432,
+      "MaintenanceDB": "miu_export_hub",
+      "Username": "miu",
+      "SSLMode": "prefer",
+      "PassFile": "/pgpass"
+    }
+  }
+}

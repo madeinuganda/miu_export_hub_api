@@ -14,9 +14,11 @@ class Settings(BaseSettings):
     jwt_access_expire_minutes: int = 30
     jwt_refresh_expire_days: int = 7
     storage_path: str = "./uploads"
-    cors_origins: str = "http://localhost:5173"
-    frontend_base_url: str = "http://localhost:5173"
-    environment: str = "development"
+    # cors_origins: str = "http://localhost:5173"
+    cors_origins: str = "*"
+    # frontend_base_url: str = "http://localhost:5173"
+    frontend_base_url: str = "http://89.117.56.56/export-hub"
+    environment: str = "production"
     password_reset_ttl_hours: int = 1
     max_upload_bytes: int = 10 * 1024 * 1024
     allowed_mime_types: str = "application/pdf,image/jpeg,image/png,image/webp"
@@ -26,8 +28,8 @@ class Settings(BaseSettings):
 
     # EgoSMS — same provider as made-in-uganda-web (app/Utils.php)
     egosms_api_url: str = "https://comms.egosms.co/api/v1/json/"
-    egosms_username: str = ""
-    egosms_password: str = ""
+    egosms_username: str = "timothymutesasira"
+    egosms_password: str = "9d2f95e9e9c7338ed5047e56a9c980bc76b19245b9d23fa4"
     sms_default_calling_prefix: str = "256"
     sms_ego_sender_default: str = "NotifyMe"
     sms_ego_sender_ug: str = "UG-SMS"

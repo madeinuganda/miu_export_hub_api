@@ -178,6 +178,46 @@ class VerificationApplicationsResponse(BaseModel):
     pages: int
 
 
+class BuyerProfileSectionItem(BaseModel):
+    key: str
+    label: str
+    status: str
+    detail: str | None = None
+    required: bool = True
+
+
+class BuyerAdminItem(BaseModel):
+    id: UUID
+    org_id: UUID
+    company_name: str
+    industry: str
+    location: str
+    contact_name: str
+    email: str
+    phone: str | None = None
+    website: str | None = None
+    job_title: str | None = None
+    submitted_at: datetime | None
+    hours_elapsed: int
+    status: str
+    verified_buyer: bool
+    info_requested: bool
+    admin_message: str | None = None
+    missing_items: list[str] = []
+    profile_sections: list[BuyerProfileSectionItem]
+    rfq_count: int = 0
+
+
+class BuyerAdminListResponse(BaseModel):
+    summary: dict[str, int]
+    pending: list[BuyerAdminItem]
+    processed: list[BuyerAdminItem]
+    page: int
+    page_size: int
+    total: int
+    pages: int
+
+
 class OrderPipelineStepsResponse(BaseModel):
     stages: list[AdminPipelineStage]
 

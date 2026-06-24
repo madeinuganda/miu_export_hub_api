@@ -23,7 +23,7 @@ from app.models.enums import (
     SenderRole,
     VerificationStatus,
 )
-from app.models.misc import AdminActionLog, FileRecord, RegistrationDocument, SupplierRegistrationDraft
+from app.models.misc import AdminActionLog, BuyerRegistrationDraft, FileRecord, RegistrationDocument, SupplierRegistrationDraft
 from app.models.orders import Order, OrderActivity, OrderMilestone, OrderTracking
 from app.models.organizations import BuyerOrganization, SupplierOrganization
 from app.models.payments import PaymentEscrow, PaymentMilestone
@@ -41,6 +41,9 @@ from app.schemas.admin import (
     OrderMilestoneUpdateResponse,
     RelayQuoteRequest,
     RfqAssignRequest,
+    BuyerAdminItem,
+    BuyerAdminListResponse,
+    BuyerProfileSectionItem,
     VerificationApplicationItem,
     VerificationApplicationsResponse,
     VerificationDocumentItem,
@@ -182,7 +185,7 @@ class AdminService:
                 select(func.count())
                 .select_from(SupplierOrganization)
                 .where(
-                    SupplierOrganization.verification_status == VerificationStatus.PENDING,
+                    SupplierOrganization.verification_status == VerificationStatus.PENDING.value,
                     SupplierOrganization.deleted_at.is_(None),
                 )
             )
@@ -191,7 +194,7 @@ class AdminService:
             await db.execute(
                 select(func.count())
                 .select_from(Rfq)
-                .where(Rfq.status == RfqStatus.AWAITING, Rfq.deleted_at.is_(None))
+                .where(Rfq.status == RfqStatus.AWAITING.value, Rfq.deleted_at.is_(None))
             )
         ).scalar() or 0
         return {"unread_count": int(pending_suppliers) + int(new_rfqs)}
@@ -316,7 +319,7 @@ class AdminService:
                     .join(Product, Product.supplier_org_id == SupplierOrganization.id)
                     .where(
                         Product.category_id == product.category_id,
-                        SupplierOrganization.verification_status == VerificationStatus.APPROVED,
+                        SupplierOrganization.verification_status == VerificationStatus.APPROVED.value,
                         SupplierOrganization.deleted_at.is_(None),
                         Product.deleted_at.is_(None),
                     )
@@ -459,7 +462,7 @@ class AdminService:
                 select(Rfq)
                 .where(
                     Rfq.deleted_at.is_(None),
-                    Rfq.status.in_((RfqStatus.AWAITING, RfqStatus.RESPONDED, RfqStatus.ACCEPTED)),
+                    Rfq.status.in_((RfqStatus.AWAITING.value, RfqStatus.RESPONDED.value, RfqStatus.ACCEPTED.value)),
                 )
                 .order_by(Rfq.updated_at.desc())
             )
@@ -1309,10 +1312,10 @@ class AdminService:
                     SupplierOrganization.deleted_at.is_(None),
                     SupplierOrganization.verification_status.in_(
                         (
-                            VerificationStatus.PENDING,
-                            VerificationStatus.APPROVED,
-                            VerificationStatus.REJECTED,
-                            VerificationStatus.SUSPENDED,
+                            VerificationStatus.PENDING.value,
+                            VerificationStatus.APPROVED.value,
+                            VerificationStatus.REJECTED.value,
+                            VerificationStatus.SUSPENDED.value,
                         )
                     ),
                 )
@@ -1476,3 +1479,589 @@ class AdminService:
         apply_create_audit(log, admin.id)
         db.add(log)
         return {"ok": True, "status": org.verification_status.value}
+
+    # --- Verification document moderation & cleanup ---
+
+    @staticmethod
+    async def _get_registration_document(db: AsyncSession, doc_id: UUID) -> RegistrationDocument:
+        doc = await db.get(RegistrationDocument, doc_id)
+        if not doc or doc.deleted_at:
+            raise AppError(404, "Document not found", "not_found")
+        return doc
+
+    @staticmethod
+    async def approve_verification_document(
+        db: AsyncSession, admin: AdminAccount, doc_id: UUID, reason: str | None
+    ) -> dict:
+        doc = await AdminService._get_registration_document(db, doc_id)
+        doc.status = DocumentStatus.APPROVED
+        apply_update_audit(doc, admin.id)
+
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="verification_doc_approved",
+            entity_type="registration_document",
+            entity_id=doc.id,
+            metadata_={"reason": reason},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"ok": True, "status": doc.status.value}
+
+    @staticmethod
+    async def reject_verification_document(
+        db: AsyncSession, admin: AdminAccount, doc_id: UUID, reason: str | None
+    ) -> dict:
+        doc = await AdminService._get_registration_document(db, doc_id)
+        doc.status = DocumentStatus.REJECTED
+        apply_update_audit(doc, admin.id)
+
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="verification_doc_rejected",
+            entity_type="registration_document",
+            entity_id=doc.id,
+            metadata_={"reason": reason},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"ok": True, "status": doc.status.value}
+
+    @staticmethod
+    async def flag_verification_document(
+        db: AsyncSession, admin: AdminAccount, doc_id: UUID, reason: str | None
+    ) -> dict:
+        # Represent "flagged" using REJECTED plus metadata so existing enums still apply.
+        doc = await AdminService._get_registration_document(db, doc_id)
+        doc.status = DocumentStatus.REJECTED
+        apply_update_audit(doc, admin.id)
+
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="verification_doc_flagged",
+            entity_type="registration_document",
+            entity_id=doc.id,
+            metadata_={"reason": reason, "flagged": True},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"ok": True, "status": doc.status.value}
+
+    @staticmethod
+    async def delete_verification_document(
+        db: AsyncSession, admin: AdminAccount, doc_id: UUID, *, hard: bool = False
+    ) -> dict:
+        doc = await AdminService._get_registration_document(db, doc_id)
+        if hard:
+            await db.delete(doc)
+        else:
+            soft_delete(doc, admin.id)
+        return {"ok": True, "id": str(doc_id), "hard": hard}
+
+    @staticmethod
+    async def delete_file_record(
+        db: AsyncSession, admin: AdminAccount, file_id: UUID, *, hard: bool = False
+    ) -> dict:
+        record = await db.get(FileRecord, file_id)
+        if not record or record.deleted_at:
+            raise AppError(404, "File not found", "not_found")
+
+        if hard:
+            await db.delete(record)
+        else:
+            soft_delete(record, admin.id)
+        return {"ok": True, "id": str(file_id), "hard": hard}
+
+    # --- Buyer admin ---
+
+    @staticmethod
+    def _buyer_review_status(org: BuyerOrganization) -> str:
+        status = org.onboarding_status
+        if status == VerificationStatus.ACTION_REQUIRED:
+            return "action_required"
+        if status == VerificationStatus.PENDING:
+            return "pending"
+        if status == VerificationStatus.APPROVED:
+            return "approved"
+        if status == VerificationStatus.REJECTED:
+            return "rejected"
+        if status == VerificationStatus.SUSPENDED:
+            return "suspended"
+        return "pending"
+
+    @staticmethod
+    async def _buyer_primary_account(db: AsyncSession, org_id: UUID) -> BuyerAccount | None:
+        member = (
+            await db.execute(
+                select(BuyerOrganizationMember)
+                .where(
+                    BuyerOrganizationMember.org_id == org_id,
+                    BuyerOrganizationMember.deleted_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if not member:
+            return None
+        return await db.get(BuyerAccount, member.buyer_account_id)
+
+    @staticmethod
+    async def _buyer_admin_message(db: AsyncSession, org_id: UUID) -> tuple[str | None, list[str]]:
+        log = (
+            await db.execute(
+                select(AdminActionLog)
+                .where(
+                    AdminActionLog.entity_type == "buyer_org",
+                    AdminActionLog.entity_id == org_id,
+                    AdminActionLog.action == "request_buyer_info",
+                    AdminActionLog.deleted_at.is_(None),
+                )
+                .order_by(AdminActionLog.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if not log or not log.metadata_:
+            return None, []
+        meta = log.metadata_
+        return meta.get("message"), list(meta.get("missing_items") or [])
+
+    @staticmethod
+    def _buyer_profile_sections(
+        org: BuyerOrganization,
+        account: BuyerAccount | None,
+        draft: BuyerRegistrationDraft | None,
+    ) -> list[BuyerProfileSectionItem]:
+        payload = (draft.payload if draft else None) or {}
+        company = payload.get("company") or {}
+        contact = payload.get("contact") or {}
+        sourcing = payload.get("sourcing") or {}
+
+        def section(key: str, label: str, ok: bool, detail: str | None = None) -> BuyerProfileSectionItem:
+            return BuyerProfileSectionItem(
+                key=key,
+                label=label,
+                status="verified" if ok else "missing",
+                detail=detail,
+                required=True,
+            )
+
+        categories = sourcing.get("categories") or []
+        markets = sourcing.get("target_markets") or sourcing.get("targetMarkets") or []
+        sourcing_detail = None
+        if categories:
+            sourcing_detail = ", ".join(str(c) for c in categories[:3])
+        elif markets:
+            sourcing_detail = ", ".join(str(m) for m in markets[:3])
+
+        contact_name = org.procurement_contact or contact.get("contact_name") or (
+            f"{account.first_name} {account.last_name}".strip() if account else ""
+        )
+
+        return [
+            section(
+                "company",
+                "Company profile",
+                bool(org.name and org.country),
+                f"{org.name} · {org.country}" if org.name else None,
+            ),
+            section(
+                "contact",
+                "Procurement contact",
+                bool(contact_name and account and account.email),
+                contact_name or None,
+            ),
+            section(
+                "sourcing",
+                "Sourcing preferences",
+                bool(categories or markets or sourcing.get("annual_import_volume")),
+                sourcing_detail,
+            ),
+            section(
+                "email",
+                "Email verified",
+                bool(account and account.email_verified_at),
+                account.email if account else None,
+            ),
+        ]
+
+    @staticmethod
+    def _missing_items_from_sections(sections: list[BuyerProfileSectionItem]) -> list[str]:
+        return [s.label for s in sections if s.status != "verified" and s.required]
+
+    @staticmethod
+    async def _serialize_buyer_admin(db: AsyncSession, org: BuyerOrganization) -> BuyerAdminItem:
+        account = await AdminService._buyer_primary_account(db, org.id)
+        draft = None
+        if account:
+            draft = (
+                await db.execute(
+                    select(BuyerRegistrationDraft).where(
+                        BuyerRegistrationDraft.buyer_account_id == account.id,
+                        BuyerRegistrationDraft.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+
+        review_status = AdminService._buyer_review_status(org)
+        submitted_at = org.onboarding_submitted_at or org.created_at
+        hours = 0
+        if submitted_at:
+            ref = submitted_at if submitted_at.tzinfo else submitted_at.replace(tzinfo=timezone.utc)
+            hours = max(0, int((datetime.now(timezone.utc) - ref).total_seconds() // 3600))
+
+        admin_message, logged_missing = await AdminService._buyer_admin_message(db, org.id)
+        sections = AdminService._buyer_profile_sections(org, account, draft)
+        missing_items = logged_missing or AdminService._missing_items_from_sections(sections)
+        info_requested = review_status == "action_required" or admin_message is not None
+
+        location = f"{org.city}, {org.country}" if org.city else org.country
+        industry = org.industry or "—"
+        contact_name = org.procurement_contact or (
+            f"{account.first_name} {account.last_name}".strip() if account else "—"
+        )
+        email = account.email if account else "—"
+
+        rfq_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Rfq)
+                .where(Rfq.buyer_org_id == org.id, Rfq.deleted_at.is_(None))
+            )
+        ).scalar() or 0
+
+        return BuyerAdminItem(
+            id=org.id,
+            org_id=org.id,
+            company_name=org.name,
+            industry=industry,
+            location=location,
+            contact_name=contact_name,
+            email=email,
+            phone=account.phone if account else None,
+            website=org.website,
+            job_title=org.job_title,
+            submitted_at=submitted_at,
+            hours_elapsed=hours,
+            status=review_status,
+            verified_buyer=org.verified_buyer,
+            info_requested=info_requested,
+            admin_message=admin_message,
+            missing_items=missing_items,
+            profile_sections=sections,
+            rfq_count=int(rfq_count),
+        )
+
+    @staticmethod
+    async def list_buyers(
+        db: AsyncSession,
+        *,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> BuyerAdminListResponse:
+        orgs = (
+            await db.execute(
+                select(BuyerOrganization)
+                .where(BuyerOrganization.deleted_at.is_(None))
+                .order_by(BuyerOrganization.updated_at.desc())
+            )
+        ).scalars().all()
+
+        pending: list[BuyerAdminItem] = []
+        processed: list[BuyerAdminItem] = []
+        for org in orgs:
+            if org.onboarding_status == VerificationStatus.DRAFT:
+                continue
+            item = await AdminService._serialize_buyer_admin(db, org)
+            if status == "pending" and item.status not in ("pending", "action_required"):
+                continue
+            if status == "approved" and item.status != "approved":
+                continue
+            if status == "rejected" and item.status != "rejected":
+                continue
+            if status == "processed" and item.status in ("pending", "action_required"):
+                continue
+            if item.status in ("pending", "action_required"):
+                pending.append(item)
+            else:
+                processed.append(item)
+
+        combined = pending + processed
+        paged = paginate(combined, page, page_size)
+        summary = {
+            "pending": len([a for a in combined if a.status in ("pending", "action_required")]),
+            "approved": len([a for a in combined if a.status == "approved"]),
+            "rejected": len([a for a in combined if a.status == "rejected"]),
+        }
+        pending_slice = [a for a in paged.items if a.status in ("pending", "action_required")]
+        processed_slice = [a for a in paged.items if a.status not in ("pending", "action_required")]
+        return BuyerAdminListResponse(
+            summary=summary,
+            pending=pending_slice,
+            processed=processed_slice,
+            page=paged.page,
+            page_size=paged.page_size,
+            total=paged.total,
+            pages=paged.pages,
+        )
+
+    @staticmethod
+    async def get_buyer_detail(db: AsyncSession, org_id: UUID) -> BuyerAdminItem:
+        org = await db.get(BuyerOrganization, org_id)
+        if not org or org.deleted_at:
+            raise AppError(404, "Buyer not found", "not_found")
+        return await AdminService._serialize_buyer_admin(db, org)
+
+    @staticmethod
+    async def verify_buyer(db: AsyncSession, admin: AdminAccount, org_id: UUID, data: VerifyRequest) -> dict:
+        org = await db.get(BuyerOrganization, org_id)
+        if not org or org.deleted_at:
+            raise AppError(404, "Buyer organization not found", "not_found")
+        org.onboarding_status = VerificationStatus.APPROVED if data.approved else VerificationStatus.REJECTED
+        org.verified_buyer = data.approved
+        apply_update_audit(org, admin.id)
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="verify_buyer",
+            entity_type="buyer_org",
+            entity_id=org_id,
+            metadata_={"approved": data.approved, "reason": data.reason},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"onboarding_status": org.onboarding_status.value, "verified_buyer": org.verified_buyer}
+
+    @staticmethod
+    async def request_buyer_info(
+        db: AsyncSession, admin: AdminAccount, org_id: UUID, message: str | None
+    ) -> dict:
+        org = await db.get(BuyerOrganization, org_id)
+        if not org or org.deleted_at:
+            raise AppError(404, "Buyer not found", "not_found")
+        if org.onboarding_status not in (
+            VerificationStatus.PENDING,
+            VerificationStatus.APPROVED,
+            VerificationStatus.ACTION_REQUIRED,
+        ):
+            raise AppError(400, "Cannot request information for this buyer", "invalid_status")
+
+        account = await AdminService._buyer_primary_account(db, org.id)
+        draft = None
+        if account:
+            draft = (
+                await db.execute(
+                    select(BuyerRegistrationDraft).where(
+                        BuyerRegistrationDraft.buyer_account_id == account.id,
+                        BuyerRegistrationDraft.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+        sections = AdminService._buyer_profile_sections(org, account, draft)
+        missing_items = AdminService._missing_items_from_sections(sections)
+        if not missing_items:
+            missing_items = ["Additional company or sourcing details"]
+
+        org.onboarding_status = VerificationStatus.ACTION_REQUIRED
+        org.verified_buyer = False
+        apply_update_audit(org, admin.id)
+
+        default_message = "Please update your buyer profile with the information listed below."
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="request_buyer_info",
+            entity_type="buyer_org",
+            entity_id=org.id,
+            metadata_={
+                "message": message or default_message,
+                "missing_items": missing_items,
+            },
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {
+            "ok": True,
+            "info_requested": True,
+            "status": org.onboarding_status.value,
+            "missing_items": missing_items,
+        }
+
+    @staticmethod
+    async def suspend_buyer(
+        db: AsyncSession, admin: AdminAccount, org_id: UUID, reason: str | None
+    ) -> dict:
+        org = await db.get(BuyerOrganization, org_id)
+        if not org or org.deleted_at:
+            raise AppError(404, "Buyer not found", "not_found")
+        if org.onboarding_status != VerificationStatus.APPROVED:
+            raise AppError(400, "Only approved buyers can be suspended", "invalid_status")
+
+        org.onboarding_status = VerificationStatus.SUSPENDED
+        org.verified_buyer = False
+        apply_update_audit(org, admin.id)
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="suspend_buyer",
+            entity_type="buyer_org",
+            entity_id=org.id,
+            metadata_={"reason": reason},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"ok": True, "status": org.onboarding_status.value}
+
+    @staticmethod
+    async def restore_buyer(
+        db: AsyncSession, admin: AdminAccount, org_id: UUID, reason: str | None
+    ) -> dict:
+        org = await db.get(BuyerOrganization, org_id)
+        if not org or org.deleted_at:
+            raise AppError(404, "Buyer not found", "not_found")
+        if org.onboarding_status != VerificationStatus.SUSPENDED:
+            raise AppError(400, "Only suspended buyers can be restored", "invalid_status")
+
+        org.onboarding_status = VerificationStatus.APPROVED
+        org.verified_buyer = True
+        apply_update_audit(org, admin.id)
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="restore_buyer",
+            entity_type="buyer_org",
+            entity_id=org.id,
+            metadata_={"reason": reason},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"ok": True, "status": org.onboarding_status.value}
+
+    # --- Hard/soft delete helpers for buyers, suppliers, products ---
+
+    @staticmethod
+    async def delete_buyer_org(
+        db: AsyncSession,
+        admin: AdminAccount,
+        org_id: UUID,
+        *,
+        hard: bool = False,
+    ) -> dict:
+        org = await db.get(BuyerOrganization, org_id)
+        if not org or org.deleted_at:
+            raise AppError(404, "Buyer not found", "not_found")
+
+        # Do not allow hard delete while there are RFQs or orders referencing this org.
+        rfq_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Rfq)
+                .where(Rfq.buyer_org_id == org.id, Rfq.deleted_at.is_(None))
+            )
+        ).scalar() or 0
+        if hard and rfq_count > 0:
+            raise AppError(409, "Cannot hard-delete buyer with RFQs", "has_rfqs")
+
+        if hard:
+            await db.delete(org)
+        else:
+            soft_delete(org, admin.id)
+
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="delete_buyer_org_hard" if hard else "delete_buyer_org_soft",
+            entity_type="buyer_org",
+            entity_id=org.id,
+            metadata_={"hard": hard},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"ok": True, "id": str(org.id), "hard": hard}
+
+    @staticmethod
+    async def delete_supplier_org(
+        db: AsyncSession,
+        admin: AdminAccount,
+        org_id: UUID,
+        *,
+        hard: bool = False,
+    ) -> dict:
+        org = await db.get(SupplierOrganization, org_id)
+        if not org or org.deleted_at:
+            raise AppError(404, "Supplier not found", "not_found")
+
+        # Do not allow hard delete while there are products or orders referencing this org.
+        product_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Product)
+                .where(Product.supplier_org_id == org.id, Product.deleted_at.is_(None))
+            )
+        ).scalar() or 0
+        order_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Order)
+                .where(Order.supplier_org_id == org.id, Order.deleted_at.is_(None))
+            )
+        ).scalar() or 0
+        if hard and (product_count > 0 or order_count > 0):
+            raise AppError(409, "Cannot hard-delete supplier with products or orders", "has_dependants")
+
+        if hard:
+            await db.delete(org)
+        else:
+            soft_delete(org, admin.id)
+
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="delete_supplier_org_hard" if hard else "delete_supplier_org_soft",
+            entity_type="supplier_org",
+            entity_id=org.id,
+            metadata_={"hard": hard, "product_count": int(product_count), "order_count": int(order_count)},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"ok": True, "id": str(org.id), "hard": hard}
+
+    @staticmethod
+    async def delete_product(
+        db: AsyncSession,
+        admin: AdminAccount,
+        product_id: UUID,
+        *,
+        hard: bool = False,
+    ) -> dict:
+        product = await db.get(Product, product_id)
+        if not product or product.deleted_at:
+            raise AppError(404, "Product not found", "not_found")
+
+        # For now, be conservative: prevent hard delete if there are orders or RFQs for this product.
+        order_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Order)
+                .where(Order.product_id == product.id, Order.deleted_at.is_(None))
+            )
+        ).scalar() or 0
+        rfq_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Rfq)
+                .where(Rfq.product_id == product.id, Rfq.deleted_at.is_(None))
+            )
+        ).scalar() or 0
+        if hard and (order_count > 0 or rfq_count > 0):
+            raise AppError(409, "Cannot hard-delete product with RFQs or orders", "has_dependants")
+
+        if hard:
+            await db.delete(product)
+        else:
+            soft_delete(product, admin.id)
+
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="delete_product_hard" if hard else "delete_product_soft",
+            entity_type="product",
+            entity_id=product.id,
+            metadata_={"hard": hard, "order_count": int(order_count), "rfq_count": int(rfq_count)},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {"ok": True, "id": str(product.id), "hard": hard}

@@ -22,6 +22,8 @@ class Category(AuditMixin, Base):
     parent_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), ForeignKey("categories.id"), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    image_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    thumb_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
 
 class Product(AuditMixin, Base):

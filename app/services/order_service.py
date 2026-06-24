@@ -45,7 +45,7 @@ class OrderService:
             raise AppError(404, "RFQ not found", "not_found")
         quote = (
             await db.execute(
-                select(RfqQuote).where(RfqQuote.rfq_id == rfq.id, RfqQuote.status == QuoteStatus.SENT, RfqQuote.deleted_at.is_(None)).limit(1)
+                select(RfqQuote).where(RfqQuote.rfq_id == rfq.id, RfqQuote.status == QuoteStatus.SENT.value, RfqQuote.deleted_at.is_(None)).limit(1)
             )
         ).scalar_one_or_none()
         if not quote:

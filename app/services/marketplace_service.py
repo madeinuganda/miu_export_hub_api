@@ -186,7 +186,7 @@ class MarketplaceService:
     @staticmethod
     async def get_featured_products(db: AsyncSession) -> list[dict]:
         result = await db.execute(
-            select(Product).where(Product.status == ProductStatus.PUBLISHED, Product.deleted_at.is_(None)).limit(12)
+            select(Product).where(Product.status == ProductStatus.PUBLISHED.value, Product.deleted_at.is_(None)).limit(12)
         )
         products = result.scalars().all()
         return [await MarketplaceService._product_card(db, p) for p in products]

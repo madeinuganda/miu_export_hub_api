@@ -9,6 +9,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import AuditMixin
+from app.models.db_types import str_enum
 from app.models.enums import CertificationStatus, OrgMemberRole, VerificationStatus
 from app.core.database import Base
 
@@ -24,7 +25,7 @@ class BuyerOrganization(AuditMixin, Base):
     procurement_contact: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     job_title: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     onboarding_status: Mapped[VerificationStatus] = mapped_column(
-        Enum(VerificationStatus, name="buyer_onboarding_status"),
+        str_enum(VerificationStatus, name="buyer_onboarding_status"),
         default=VerificationStatus.DRAFT,
         nullable=False,
     )
@@ -57,7 +58,9 @@ class SupplierOrganization(AuditMixin, Base):
     short_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     brand_story: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     verification_status: Mapped[VerificationStatus] = mapped_column(
-        Enum(VerificationStatus, name="verification_status"), default=VerificationStatus.DRAFT, nullable=False
+        str_enum(VerificationStatus, name="verification_status"),
+        default=VerificationStatus.DRAFT,
+        nullable=False,
     )
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     storefront_published: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

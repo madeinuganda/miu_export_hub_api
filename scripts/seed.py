@@ -109,10 +109,73 @@ async def seed() -> None:
             industry="Organic Food Retail",
             onboarding_status=VerificationStatus.APPROVED,
             verified_buyer=True,
+            onboarding_submitted_at=datetime.now(timezone.utc),
+            procurement_contact="Hans Müller",
+            job_title="Procurement Director",
+            website="https://naturkost.de",
         )
         apply_create_audit(buyer_org, buyer_account.id)
         db.add(buyer_org)
         await db.flush()
+
+        pending_buyer_account = BuyerAccount(
+            email="pending.buyer@example.com",
+            password_hash=buyer_account.password_hash,
+            first_name="Amina",
+            last_name="Nakato",
+            phone="+256 700 000 001",
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+        )
+        apply_create_audit(pending_buyer_account, buyer_account.id)
+        db.add(pending_buyer_account)
+        await db.flush()
+
+        pending_buyer_org = BuyerOrganization(
+            name="Kampala Fresh Imports Ltd",
+            country="Uganda",
+            city="Kampala",
+            industry="Food & Beverage",
+            onboarding_status=VerificationStatus.PENDING,
+            verified_buyer=False,
+            onboarding_submitted_at=datetime.now(timezone.utc),
+            procurement_contact="Amina Nakato",
+            job_title="Head of Procurement",
+        )
+        apply_create_audit(pending_buyer_org, buyer_account.id)
+        db.add(pending_buyer_org)
+        await db.flush()
+        db.add(
+            BuyerOrganizationMember(
+                org_id=pending_buyer_org.id,
+                buyer_account_id=pending_buyer_account.id,
+                role=OrgMemberRole.OWNER,
+                created_by=buyer_account.id,
+                updated_by=buyer_account.id,
+            )
+        )
+        db.add(
+            BuyerRegistrationDraft(
+                buyer_account_id=pending_buyer_account.id,
+                step="review",
+                payload={
+                    "company": {
+                        "company_name": "Kampala Fresh Imports Ltd",
+                        "country": "Uganda",
+                        "city": "Kampala",
+                        "industry": "Food & Beverage",
+                    },
+                    "contact": {"contact_name": "Amina Nakato", "job_title": "Head of Procurement"},
+                    "sourcing": {
+                        "categories": ["Coffee", "Vanilla"],
+                        "target_markets": ["EU", "UK"],
+                        "annual_import_volume": "500-1000 MT",
+                    },
+                },
+                created_by=buyer_account.id,
+                updated_by=buyer_account.id,
+            )
+        )
         db.add(
             BuyerOrganizationMember(
                 org_id=buyer_org.id,

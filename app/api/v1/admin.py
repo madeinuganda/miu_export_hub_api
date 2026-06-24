@@ -13,6 +13,7 @@ from app.core.dependencies import require_admin_password_changed
 from app.core.exceptions import AppError
 from app.models.accounts import AdminAccount
 from app.models.misc import FileRecord
+from app.schemas.catalog import CategoryCreate, CategoryItem, CategoryListResponse, CategoryUpdate
 from app.schemas.admin import (
     AdminDealListResponse,
     AdminNotificationsSummary,
@@ -25,6 +26,8 @@ from app.schemas.admin import (
     OrderPipelineStepsResponse,
     RelayQuoteRequest,
     RfqAssignRequest,
+    BuyerAdminItem,
+    BuyerAdminListResponse,
     VerificationApplicationsResponse,
     VerificationApplicationItem,
     VerificationRequestInfoBody,
@@ -33,6 +36,7 @@ from app.schemas.admin import (
 from app.schemas.auth import AdminInviteRequest, AdminInviteResponse
 from app.services.admin_auth_service import AdminAuthService
 from app.services.admin_service import AdminService
+from app.services.category_service import CategoryService
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -239,6 +243,49 @@ async def restore_verification_application(
     return await AdminService.restore_supplier(db, admin, application_id, body.message)
 
 
+@router.post("/verification/documents/{doc_id}/approve")
+async def approve_verification_document(
+    doc_id: UUID,
+    data: VerificationRequestInfoBody | None = None,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    body = data or VerificationRequestInfoBody()
+    return await AdminService.approve_verification_document(db, admin, doc_id, body.message)
+
+
+@router.post("/verification/documents/{doc_id}/reject")
+async def reject_verification_document(
+    doc_id: UUID,
+    data: VerificationRequestInfoBody | None = None,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    body = data or VerificationRequestInfoBody()
+    return await AdminService.reject_verification_document(db, admin, doc_id, body.message)
+
+
+@router.post("/verification/documents/{doc_id}/flag")
+async def flag_verification_document(
+    doc_id: UUID,
+    data: VerificationRequestInfoBody | None = None,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    body = data or VerificationRequestInfoBody()
+    return await AdminService.flag_verification_document(db, admin, doc_id, body.message)
+
+
+@router.delete("/verification/documents/{doc_id}")
+async def delete_verification_document(
+    doc_id: UUID,
+    hard: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.delete_verification_document(db, admin, doc_id, hard=hard)
+
+
 @router.get("/files/{file_id}")
 async def download_verification_file(
     file_id: UUID,
@@ -262,6 +309,16 @@ async def download_verification_file(
     )
 
 
+@router.delete("/files/{file_id}")
+async def delete_file_record(
+    file_id: UUID,
+    hard: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.delete_file_record(db, admin, file_id, hard=hard)
+
+
 @router.post("/invites", response_model=AdminInviteResponse)
 async def invite_admin(
     data: AdminInviteRequest,
@@ -281,6 +338,36 @@ async def verify_supplier(
     return await AdminService.verify_supplier(db, admin, org_id, data)
 
 
+@router.delete("/suppliers/{org_id}")
+async def delete_supplier(
+    org_id: UUID,
+    hard: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.delete_supplier_org(db, admin, org_id, hard=hard)
+
+
+@router.get("/buyers", response_model=BuyerAdminListResponse)
+async def list_buyers(
+    status: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.list_buyers(db, status=status, page=page, page_size=page_size)
+
+
+@router.get("/buyers/{org_id}", response_model=BuyerAdminItem)
+async def get_buyer(
+    org_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    _: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.get_buyer_detail(db, org_id)
+
+
 @router.post("/buyers/{org_id}/verify")
 async def verify_buyer(
     org_id: UUID,
@@ -288,29 +375,104 @@ async def verify_buyer(
     db: AsyncSession = Depends(get_db),
     admin: AdminAccount = Depends(require_admin_password_changed),
 ):
-    from app.models.organizations import BuyerOrganization
-    from app.models.enums import VerificationStatus
-    from app.models.misc import AdminActionLog
-    from app.utils.audit import apply_create_audit, apply_update_audit
+    return await AdminService.verify_buyer(db, admin, org_id, data)
 
-    org = await db.get(BuyerOrganization, org_id)
-    if not org:
-        from app.core.exceptions import AppError
 
-        raise AppError(404, "Buyer organization not found", "not_found")
-    org.onboarding_status = VerificationStatus.APPROVED if data.approved else VerificationStatus.REJECTED
-    org.verified_buyer = data.approved
-    apply_update_audit(org, admin.id)
-    log = AdminActionLog(
-        admin_account_id=admin.id,
-        action="verify_buyer",
-        entity_type="buyer_org",
-        entity_id=org_id,
-        metadata_={"approved": data.approved, "reason": data.reason},
-    )
-    apply_create_audit(log, admin.id)
-    db.add(log)
-    return {"onboarding_status": org.onboarding_status.value, "verified_buyer": org.verified_buyer}
+@router.post("/buyers/{org_id}/request-info")
+async def request_buyer_info(
+    org_id: UUID,
+    data: VerificationRequestInfoBody,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.request_buyer_info(db, admin, org_id, data.message)
+
+
+@router.post("/buyers/{org_id}/suspend")
+async def suspend_buyer(
+    org_id: UUID,
+    data: VerificationRequestInfoBody,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.suspend_buyer(db, admin, org_id, data.message)
+
+
+@router.post("/buyers/{org_id}/restore")
+async def restore_buyer(
+    org_id: UUID,
+    data: VerificationRequestInfoBody,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.restore_buyer(db, admin, org_id, data.message)
+
+
+@router.delete("/buyers/{org_id}")
+async def delete_buyer(
+    org_id: UUID,
+    hard: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.delete_buyer_org(db, admin, org_id, hard=hard)
+
+
+@router.get("/categories", response_model=CategoryListResponse)
+async def list_categories(
+    active_only: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    _: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await CategoryService.list_categories(db, active_only=active_only)
+
+
+@router.get("/categories/{category_id}", response_model=CategoryItem)
+async def get_category(
+    category_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    _: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await CategoryService.get_category(db, category_id)
+
+
+@router.post("/categories", response_model=CategoryItem, status_code=201)
+async def create_category(
+    data: CategoryCreate,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await CategoryService.create_category(db, admin, data)
+
+
+@router.patch("/categories/{category_id}", response_model=CategoryItem)
+async def update_category(
+    category_id: UUID,
+    data: CategoryUpdate,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await CategoryService.update_category(db, admin, category_id, data)
+
+
+@router.delete("/categories/{category_id}")
+async def delete_category(
+    category_id: UUID,
+    hard: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await CategoryService.delete_category(db, admin, category_id, hard=hard)
+
+
+@router.delete("/products/{product_id}")
+async def delete_product(
+    product_id: UUID,
+    hard: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.delete_product(db, admin, product_id, hard=hard)
 
 
 @router.put("/cms/{section}")

@@ -334,6 +334,17 @@ async def _upsert_draft(db: AsyncSession, account_id: UUID, step: str, payload: 
     return draft
 
 
+@router.get("/categories")
+async def supplier_categories(
+    db: AsyncSession = Depends(get_db),
+    _: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    from app.services.category_service import CategoryService
+
+    resp = await CategoryService.list_categories(db, active_only=True)
+    return {"items": [{"id": str(i.id), "slug": i.slug, "label": i.label} for i in resp.items]}
+
+
 @router.get("/products")
 async def supplier_products(
     q: str | None = None,
@@ -352,14 +363,30 @@ async def create_product(
     account: SupplierAccount = Depends(require_supplier_password_changed),
 ):
     from decimal import Decimal
-    from app.models.catalog import Product
+    from app.core.exceptions import AppError
+    from app.models.catalog import Category, Product
     from app.models.enums import StockStatus
+
+    raw_category_id = data.get("categoryId") or data.get("category_id")
+    category_label = data.get("category")
+    resolved_category_id: UUID | None = None
+    if raw_category_id:
+        try:
+            resolved_category_id = UUID(str(raw_category_id))
+        except ValueError as exc:
+            raise AppError(400, "Invalid category id", "validation_error") from exc
+        cat = await db.get(Category, resolved_category_id)
+        if not cat or cat.deleted_at or not cat.is_active:
+            raise AppError(400, "Category not found or inactive", "invalid_category")
+        category_label = cat.label
+
     status_raw = str(data.get("status", "draft")).lower()
     p = Product(
         supplier_org_id=org.id,
         sku=data.get("sku", "PRD-NEW"),
         name=data["name"],
-        subcategory=data.get("category"),
+        category_id=resolved_category_id,
+        subcategory=category_label,
         description=data.get("description"),
         origin_story=data.get("originStory") or data.get("origin_story"),
         status=ProductStatus.DRAFT if status_raw == "draft" else ProductStatus.PUBLISHED,

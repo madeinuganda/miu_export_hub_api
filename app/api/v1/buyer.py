@@ -244,9 +244,10 @@ async def buyer_browse(
     category_id: UUID | None = None,
     q: str | None = None,
     db: AsyncSession = Depends(get_db),
+    org: BuyerOrganization = Depends(get_buyer_org),
     _: BuyerAccount = Depends(require_buyer_password_changed),
 ):
-    return await CatalogService.buyer_browse(db, category_id, q)
+    return await CatalogService.buyer_browse(db, category_id, q, customer_type=org.industry)
 
 
 @router.get("/products")
@@ -255,16 +256,17 @@ async def buyer_products(
     supplier_org_id: UUID | None = None,
     q: str | None = None,
     db: AsyncSession = Depends(get_db),
+    org: BuyerOrganization = Depends(get_buyer_org),
     _: BuyerAccount = Depends(require_buyer_password_changed),
 ):
-    data = await CatalogService.buyer_browse(db, category_id, q)
+    data = await CatalogService.buyer_browse(db, category_id, q, customer_type=org.industry)
     if supplier_org_id:
         from app.models.catalog import Product
         from app.models.enums import ProductStatus
         result = await db.execute(
             select(Product).where(
                 Product.supplier_org_id == supplier_org_id,
-                Product.status == ProductStatus.PUBLISHED,
+                Product.status == ProductStatus.PUBLISHED.value,
                 Product.deleted_at.is_(None),
             )
         )
@@ -479,8 +481,13 @@ async def buyer_notif_summary(db: AsyncSession = Depends(get_db), account: Buyer
 
 
 @router.get("/search")
-async def buyer_search(q: str = Query(...), db: AsyncSession = Depends(get_db), _: BuyerAccount = Depends(require_buyer_password_changed)):
-    browse = await CatalogService.buyer_browse(db, q=q)
+async def buyer_search(
+    q: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    org: BuyerOrganization = Depends(get_buyer_org),
+    _: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    browse = await CatalogService.buyer_browse(db, q=q, customer_type=org.industry)
     return {"query": q, "destinations": {"products": browse["products"][:5], "browse": "/dashboard/buyer/browse"}}
 
 

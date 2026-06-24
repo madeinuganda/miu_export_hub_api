@@ -13,22 +13,53 @@ from app.utils.formatting import format_quantity, format_ugx
 
 
 ANONYMIZED_SUPPLIER = "via MIU"
+SHOP_CATEGORY_SECTION_FALLBACKS: list[tuple[str, str]] = [
+    ("packaged-foods", "Packaged Foods"),
+    ("beverages", "Beverages"),
+    ("snacks", "Snacks"),
+    ("home-care", "Home Care"),
+    ("personal-care", "Personal Care"),
+    ("household", "Household Essentials"),
+]
 
 
 class CatalogService:
     @staticmethod
-    async def buyer_browse(db: AsyncSession, category_id: UUID | None = None, q: str | None = None) -> dict:
+    def _is_shop_customer(customer_type: str | None) -> bool:
+        normalized = (customer_type or "").strip().lower()
+        return normalized in {"shop", "retail", "retailer"}
+
+    @staticmethod
+    def _with_shop_category_sections(categories: list[Category]) -> list[dict]:
+        items = [{"id": c.slug, "label": c.label, "count": "24+"} for c in categories]
+        existing_ids = {item["id"] for item in items}
+        for section_id, label in SHOP_CATEGORY_SECTION_FALLBACKS:
+            if section_id in existing_ids:
+                continue
+            items.append({"id": section_id, "label": label, "count": "24+"})
+        return items
+
+    @staticmethod
+    async def buyer_browse(
+        db: AsyncSession,
+        category_id: UUID | None = None,
+        q: str | None = None,
+        customer_type: str | None = None,
+    ) -> dict:
         cats = (
             await db.execute(select(Category).where(Category.is_active.is_(True), Category.deleted_at.is_(None)).order_by(Category.sort_order))
         ).scalars().all()
-        query = select(Product).where(Product.status == ProductStatus.PUBLISHED, Product.deleted_at.is_(None))
+        query = select(Product).where(Product.status == ProductStatus.PUBLISHED.value, Product.deleted_at.is_(None))
         if category_id:
             query = query.where(Product.category_id == category_id)
         if q:
             query = query.where(or_(Product.name.ilike(f"%{q}%"), Product.description.ilike(f"%{q}%")))
         products = (await db.execute(query.limit(50))).scalars().all()
+        categories_payload = [{"id": c.slug, "label": c.label, "count": "24+"} for c in cats]
+        if CatalogService._is_shop_customer(customer_type):
+            categories_payload = CatalogService._with_shop_category_sections(cats)
         return {
-            "categories": [{"id": c.slug, "label": c.label, "count": "24+"} for c in cats],
+            "categories": categories_payload,
             "frequentlySearched": ["Coffee", "Vanilla", "Shea Butter"],
             "stats": [],
             "featuredSuppliers": [],

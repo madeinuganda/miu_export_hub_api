@@ -44,3 +44,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Trigger Jenkins Deployment
+        run: |
+          curl -X POST \
+            --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_TOKEN }}" \
+            "http://161.97.136.101:32000/job/exporthub-api-deploy/build?token=exporthub-api-deploy-token"

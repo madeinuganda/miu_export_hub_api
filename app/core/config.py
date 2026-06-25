@@ -2,7 +2,18 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def async_database_url(url: str) -> str:
+    """Ensure SQLAlchemy async engine uses asyncpg, not psycopg2."""
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+    for prefix in ("postgresql+psycopg2://", "postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+asyncpg://" + url[len(prefix) :]
+    return url
 
 
 class Settings(BaseSettings):
@@ -54,6 +65,13 @@ class Settings(BaseSettings):
     # FCM HTTP v1 — service account JSON (push_notification_key in business_settings)
     fcm_service_account_json: str = ""
     fcm_service_account_path: str = ""
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: object) -> object:
+        if isinstance(value, str):
+            return async_database_url(value)
+        return value
 
     @property
     def cors_origin_list(self) -> list[str]:

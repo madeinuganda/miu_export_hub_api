@@ -16,7 +16,7 @@ from sqlalchemy.dialects import postgresql
 from migration_utils import column_exists, table_exists
 
 revision: str = "002"
-down_revision: Union[str, None] = None
+down_revision: Union[str, None] = "001"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -61,7 +61,7 @@ def upgrade() -> None:
         ),
     ]
     for name, col in org_columns:
-        if not column_exists("buyer_organizations", name):
+        if table_exists("buyer_organizations") and not column_exists("buyer_organizations", name):
             op.add_column("buyer_organizations", col)
 
     if not table_exists("buyer_registration_drafts"):

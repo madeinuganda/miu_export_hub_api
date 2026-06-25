@@ -2,6 +2,8 @@
 
 from alembic import op
 
+from migration_utils import table_exists
+
 revision = "007_normalize_verification_enums"
 down_revision = "006_buyer_action_required"
 branch_labels = None
@@ -27,7 +29,11 @@ def _normalize_enum(column: str, table: str, type_name: str) -> None:
 
 
 def upgrade() -> None:
+    if not table_exists("buyer_organizations"):
+        return
     _normalize_enum("onboarding_status", "buyer_organizations", "buyer_onboarding_status")
+    if not table_exists("supplier_organizations"):
+        return
     _normalize_enum("verification_status", "supplier_organizations", "verification_status")
 
 

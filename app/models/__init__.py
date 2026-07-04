@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.models.accounts import (
+from app.models.export_hub.accounts import (
     AdminAccount,
     AdminSession,
     BuyerAccount,
@@ -13,7 +13,7 @@ from app.models.accounts import (
     SupplierNotification,
     SupplierSession,
 )
-from app.models.organizations import (
+from app.models.export_hub.organizations import (
     BuyerOrganization,
     BuyerOrganizationMember,
     SupplierOrganization,
@@ -22,8 +22,8 @@ from app.models.organizations import (
     SupplierCertification,
     SupplierGalleryPhoto,
 )
-from app.models.catalog import Category, Product, ProductImage, ProductCertification, ProductBadge, PlatformStat
-from app.models.marketplace import (
+from app.models.export_hub.catalog import Category, Product, ProductImage, ProductCertification, ProductBadge, PlatformStat
+from app.models.export_hub.marketplace import (
     CmsSiteSettings,
     CmsHero,
     CmsTrustItem,
@@ -36,11 +36,11 @@ from app.models.marketplace import (
     CmsSupplierHero,
     CmsNavLink,
 )
-from app.models.rfqs import Rfq, RfqQuote, RfqMessage
-from app.models.orders import Order, OrderMilestone, OrderActivity, OrderTracking, OrderDocument
-from app.models.payments import PaymentEscrow, PaymentMilestone, PaymentLink
-from app.models.messaging import ConversationThread, ConversationMessage, MessageAttachment
-from app.models.misc import (
+from app.models.export_hub.rfqs import Rfq, RfqQuote, RfqMessage
+from app.models.export_hub.orders import Order, OrderMilestone, OrderActivity, OrderTracking, OrderDocument
+from app.models.export_hub.payments import PaymentEscrow, PaymentMilestone, PaymentLink
+from app.models.export_hub.messaging import ConversationThread, ConversationMessage, MessageAttachment
+from app.models.export_hub.misc import (
     BuyerSavedSupplier,
     FileRecord,
     SupplierRegistrationDraft,
@@ -50,6 +50,33 @@ from app.models.misc import (
     ExportChecklistTemplate,
     ExportChecklistProgress,
     AdminActionLog,
+)
+from app.models.shared.rbac import AccountRoleAssignment, Permission, Role, RolePermission
+from app.models.ecommerce.accounts import (
+    CustomerAccount,
+    CustomerAddress,
+    CustomerSession,
+    EcommerceAdminAccount,
+    EcommerceAdminSession,
+    EcommerceShop,
+    SellerAccount,
+    SellerSession,
+)
+from app.models.ecommerce.catalog import (
+    EcommerceBanner,
+    EcommerceBrand,
+    EcommerceCategory,
+    EcommerceGuest,
+    EcommerceProduct,
+    EcommerceProductImage,
+)
+from app.models.ecommerce.addresses import EcommerceShippingAddress
+from app.models.ecommerce.cart import EcommerceCartItem
+from app.models.ecommerce.orders import (
+    EcommerceCartShipping,
+    EcommerceOrder,
+    EcommerceOrderItem,
+    EcommercePaymentRequest,
 )
 
 __all__ = [
@@ -111,4 +138,16 @@ __all__ = [
     "ExportChecklistTemplate",
     "ExportChecklistProgress",
     "AdminActionLog",
+    "Permission",
+    "Role",
+    "RolePermission",
+    "AccountRoleAssignment",
+    "CustomerAccount",
+    "CustomerSession",
+    "CustomerAddress",
+    "SellerAccount",
+    "SellerSession",
+    "EcommerceShop",
+    "EcommerceAdminAccount",
+    "EcommerceAdminSession",
 ]

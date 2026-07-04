@@ -8,8 +8,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_router
-from app.core.config import get_settings
-from app.core.exceptions import AppError, app_error_handler, validation_error_handler
+from app.core.shared.config import get_settings
+from app.core.shared.exceptions import AppError, app_error_handler, validation_error_handler
 
 settings = get_settings()
 
@@ -21,14 +21,20 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="MIU Export Hub API",
+    title="MIU Unified API",
     description=(
-        "Made in Uganda Export Hub — B2B export marketplace backend.\n\n"
-        "**Authentication:** send JWTs in the `Authorization` header, not query params.\n"
+        "Made in Uganda unified backend — **Export Hub** (B2B) and **E-Commerce** (retail).\n\n"
+        "Accounts, JWTs, and RBAC are scoped by `platform` (`export_hub` | `ecommerce`). "
+        "Export Hub tokens must not be used on e-commerce routes and vice versa.\n\n"
+        "**Authentication:** send JWTs in the `Authorization` header.\n"
         "- Protected routes: `Authorization: Bearer <access_token>`\n"
-        "- `/auth/refresh` and `/auth/logout`: `Authorization: Bearer <refresh_token>`"
+        "- Refresh/logout: `Authorization: Bearer <refresh_token>`\n\n"
+        "**Route prefixes:**\n"
+        "- `/api/v1/export-hub/*` — B2B export marketplace\n"
+        "- `/api/v1/ecommerce/*` — retail marketplace\n"
+        "- Legacy export hub paths remain at `/api/v1/auth/*`, `/api/v1/buyer/*`, etc."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
     swagger_ui_parameters={"persistAuthorization": True},
 )

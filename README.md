@@ -20,7 +20,7 @@ docker compose up -d --build
 
 - API: http://localhost:8030 (override with `API_PORT=8031 docker compose up -d`)
 - OpenAPI: http://localhost:8030/docs
-- **pgAdmin:** http://localhost:5050 — login `admin@miu.local` / `admin` (dev only)
+- **pgAdmin:** http://localhost:5050 — login `admin@miu.dev` / `admin` (dev only)
 - PostgreSQL: `localhost:5432` (user `miu`, **no password** in dev — `POSTGRES_HOST_AUTH_METHOD=trust`, db `miu_export_hub`)
 
 pgAdmin ships with the **MIU Export Hub** server pre-registered (`db:5432`). Open it in the browser tree — no DB password prompt.

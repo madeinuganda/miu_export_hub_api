@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - staging
   workflow_dispatch:
 
 permissions:
@@ -33,9 +34,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest
-            type=raw,value=main
             type=sha,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -46,8 +47,16 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Trigger Jenkins Deployment
+      - name: Trigger Production Jenkins Deployment
+        if: github.ref == 'refs/heads/main'
         run: |
-          curl -X POST \
+          curl -fsS -X POST \
             --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_TOKEN }}" \
             "http://161.97.136.101:32000/job/exporthub-api-deploy/build?token=exporthub-api-deploy-token"
+
+      - name: Trigger Staging Jenkins Deployment
+        if: github.ref == 'refs/heads/staging'
+        run: |
+          curl -fsS -X POST \
+            --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_TOKEN }}" \
+            "http://161.97.136.101:32000/job/staging-exporthub-api-deploy/build?token=staging-exporthub-api-token"

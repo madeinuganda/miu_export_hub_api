@@ -26,7 +26,7 @@ def upgrade() -> None:
         return
 
     import app.models  # noqa: F401 — register all models
-    from app.core.database import Base
+    from app.core.shared.database import Base
 
     bind = op.get_bind()
     Base.metadata.create_all(bind=bind)

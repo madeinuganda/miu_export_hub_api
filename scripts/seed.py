@@ -9,11 +9,11 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import AsyncSessionLocal, Base, engine
-from app.core.security import hash_password
+from app.core.shared.database import AsyncSessionLocal, Base, engine
+from app.core.shared.security import hash_password
 from app.models import *  # noqa: F401, F403
-from app.models.catalog import Category, Product, ProductBadge, ProductImage, ProductCertification, PlatformStat
-from app.models.enums import (
+from app.models.export_hub.catalog import Category, Product, ProductBadge, ProductImage, ProductCertification, PlatformStat
+from app.models.shared.enums import (
     ConversationType,
     EscrowStatus,
     MilestoneState,
@@ -27,7 +27,7 @@ from app.models.enums import (
     StockStatus,
     VerificationStatus,
 )
-from app.models.marketplace import (
+from app.models.export_hub.marketplace import (
     CmsFeature,
     CmsFeaturedProduct,
     CmsHero,
@@ -39,13 +39,13 @@ from app.models.marketplace import (
     CmsTradeCta,
     CmsTrustItem,
 )
-from app.models.messaging import ConversationMessage, ConversationThread
-from app.models.accounts import AdminAccount, BuyerAccount, BuyerNotification, BuyerPreference, SupplierAccount, SupplierNotification
-from app.models.misc import ExportChecklistTemplate
-from app.models.orders import Order, OrderActivity, OrderMilestone, OrderTracking
-from app.models.organizations import BuyerOrganization, BuyerOrganizationMember, SupplierOrganization, SupplierOrganizationMember
-from app.models.payments import PaymentEscrow, PaymentMilestone
-from app.models.rfqs import Rfq, RfqQuote
+from app.models.export_hub.messaging import ConversationMessage, ConversationThread
+from app.models.export_hub.accounts import AdminAccount, BuyerAccount, BuyerNotification, BuyerPreference, SupplierAccount, SupplierNotification
+from app.models.export_hub.misc import ExportChecklistTemplate
+from app.models.export_hub.orders import Order, OrderActivity, OrderMilestone, OrderTracking
+from app.models.export_hub.organizations import BuyerOrganization, BuyerOrganizationMember, SupplierOrganization, SupplierOrganizationMember
+from app.models.export_hub.payments import PaymentEscrow, PaymentMilestone
+from app.models.export_hub.rfqs import Rfq, RfqQuote
 from app.utils.audit import apply_create_audit
 
 
@@ -79,14 +79,21 @@ async def seed() -> None:
 
     async with AsyncSessionLocal() as db:
         admin = await ensure_seed_admin(db)
+        from app.services.shared.rbac_service import seed_default_rbac
+
+        await seed_default_rbac(db)
 
         if (
             await db.execute(
                 select(BuyerAccount).where(BuyerAccount.email == "hans.mueller@naturkost.de", BuyerAccount.deleted_at.is_(None))
             )
         ).scalar_one_or_none():
+            await seed_ecommerce_accounts(db, admin)
+            await seed_ecommerce_catalog(db, admin)
             await db.commit()
             print("Admin: admin@miu.ug / MIU@2026 (password synced). Demo data already present.")
+            print("  E-Commerce Admin:    shop-admin@miu.ug / ShopAdmin123!")
+            print("  E-Commerce Customer: shop@example.com / Customer123!")
             return
 
         buyer_account = BuyerAccount(
@@ -491,11 +498,262 @@ async def seed() -> None:
             )
         )
 
+        await seed_ecommerce_accounts(db, admin)
+        await seed_ecommerce_catalog(db, admin)
         await db.commit()
         print("Seed complete.")
-        print("  Admin:    admin@miu.ug / MIU@2026")
-        print("  Buyer:    hans.mueller@naturkost.de / Buyer123!")
-        print("  Supplier: amara@rwenzoriorganics.ug / Supplier123!")
+        print("  Export Hub Admin:  admin@miu.ug / MIU@2026")
+        print("  Export Hub Buyer:    hans.mueller@naturkost.de / Buyer123!")
+        print("  Export Hub Supplier: amara@rwenzoriorganics.ug / Supplier123!")
+        print("  E-Commerce Admin:    shop-admin@miu.ug / ShopAdmin123!")
+        print("  E-Commerce Customer: shop@example.com / Customer123!")
+
+
+async def seed_ecommerce_accounts(db: AsyncSession, actor: AdminAccount) -> None:
+    from app.models.ecommerce.accounts import CustomerAccount, EcommerceAdminAccount
+    from app.models.shared.enums import CustomerType, EcommerceAccountType, Platform
+    from app.models.shared.rbac import AccountRoleAssignment, Role
+
+    if (
+        await db.execute(
+            select(EcommerceAdminAccount).where(
+                EcommerceAdminAccount.email == "shop-admin@miu.ug",
+                EcommerceAdminAccount.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none():
+        return
+
+    ecommerce_admin = EcommerceAdminAccount(
+        email="shop-admin@miu.ug",
+        password_hash=hash_password("ShopAdmin123!"),
+        first_name="Shop",
+        last_name="Admin",
+        is_active=True,
+        email_verified_at=datetime.now(timezone.utc),
+    )
+    apply_create_audit(ecommerce_admin, actor.id)
+    db.add(ecommerce_admin)
+    await db.flush()
+
+    role = (
+        await db.execute(
+            select(Role).where(
+                Role.platform == Platform.ECOMMERCE,
+                Role.code == "ecommerce.super_admin",
+                Role.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if role:
+        db.add(
+            AccountRoleAssignment(
+                platform=Platform.ECOMMERCE,
+                account_type=EcommerceAccountType.ADMIN.value,
+                account_id=ecommerce_admin.id,
+                role_id=role.id,
+                created_by=actor.id,
+                updated_by=actor.id,
+            )
+        )
+
+    shop_customer = CustomerAccount(
+        email="shop@example.com",
+        password_hash=hash_password("Customer123!"),
+        first_name="Shop",
+        last_name="Customer",
+        customer_type=CustomerType.SHOP,
+        is_active=True,
+        email_verified_at=datetime.now(timezone.utc),
+    )
+    apply_create_audit(shop_customer, actor.id)
+    db.add(shop_customer)
+
+    retail_customer = CustomerAccount(
+        email="retail@example.com",
+        password_hash=hash_password("Customer123!"),
+        first_name="Retail",
+        last_name="Customer",
+        customer_type=CustomerType.RETAIL,
+        is_active=True,
+        email_verified_at=datetime.now(timezone.utc),
+    )
+    apply_create_audit(retail_customer, actor.id)
+    db.add(retail_customer)
+
+
+async def seed_ecommerce_catalog(db: AsyncSession, actor: AdminAccount) -> None:
+    from decimal import Decimal
+
+    from app.models.ecommerce.accounts import EcommerceShop, SellerAccount
+    from app.models.ecommerce.catalog import (
+        EcommerceBanner,
+        EcommerceBrand,
+        EcommerceCategory,
+        EcommerceProduct,
+        EcommerceProductImage,
+    )
+    from app.models.shared.enums import (
+        EcommerceBannerResourceType,
+        EcommerceCategoryPosition,
+        EcommerceDiscountType,
+        EcommerceProductStatus,
+        StockStatus,
+    )
+
+    if (
+        await db.execute(
+            select(EcommerceProduct).where(EcommerceProduct.deleted_at.is_(None)).limit(1)
+        )
+    ).scalar_one_or_none():
+        return
+
+    seller = SellerAccount(
+        email="vendor@miu.ug",
+        password_hash=hash_password("Seller123!"),
+        first_name="Uganda",
+        last_name="Vendor",
+        is_active=True,
+        email_verified_at=datetime.now(timezone.utc),
+    )
+    apply_create_audit(seller, actor.id)
+    db.add(seller)
+    await db.flush()
+
+    shop = EcommerceShop(
+        seller_account_id=seller.id,
+        name="Kampala Fresh Market",
+        slug="kampala-fresh",
+        tagline="Quality Ugandan goods for your shop",
+        is_published=True,
+    )
+    apply_create_audit(shop, actor.id)
+    db.add(shop)
+    await db.flush()
+
+    root_cat = EcommerceCategory(
+        name="Packaged Foods",
+        slug="packaged-foods",
+        position=EcommerceCategoryPosition.ROOT,
+        priority=10,
+        home_status=True,
+    )
+    apply_create_audit(root_cat, actor.id)
+    db.add(root_cat)
+    await db.flush()
+
+    sub_cat = EcommerceCategory(
+        name="Snacks",
+        slug="snacks",
+        parent_id=root_cat.id,
+        position=EcommerceCategoryPosition.SUB,
+        priority=5,
+        home_status=True,
+    )
+    apply_create_audit(sub_cat, actor.id)
+    db.add(sub_cat)
+    await db.flush()
+
+    brand = EcommerceBrand(name="MIU Select", slug="miu-select", is_active=True)
+    apply_create_audit(brand, actor.id)
+    db.add(brand)
+    await db.flush()
+
+    products = [
+        EcommerceProduct(
+            shop_id=shop.id,
+            name="Roasted Groundnut Snack 500g",
+            code="SNK-001",
+            slug="roasted-groundnut-snack-500g",
+            category_id=root_cat.id,
+            sub_category_id=sub_cat.id,
+            brand_id=brand.id,
+            unit_price=Decimal("8500"),
+            discount=Decimal("10"),
+            discount_type=EcommerceDiscountType.PERCENT,
+            thumbnail_url="https://images.unsplash.com/photo-1599599810769-0c5e0b0a0a0a?w=400",
+            details="Crunchy roasted groundnuts — perfect for retail shelves.",
+            status=EcommerceProductStatus.PUBLISHED,
+            featured=True,
+            current_stock=500,
+            stock_status=StockStatus.IN_STOCK,
+            average_review=Decimal("4.5"),
+            reviews_count=12,
+        ),
+        EcommerceProduct(
+            shop_id=shop.id,
+            name="Uganda Coffee Beans 1kg",
+            code="BEV-001",
+            slug="uganda-coffee-beans-1kg",
+            category_id=root_cat.id,
+            brand_id=brand.id,
+            unit_price=Decimal("45000"),
+            discount=Decimal("0"),
+            discount_type=EcommerceDiscountType.PERCENT,
+            thumbnail_url="https://images.unsplash.com/photo-1559056199-641a0ac8b55e?w=400",
+            details="Premium Arabica coffee beans from Rwenzori region.",
+            status=EcommerceProductStatus.PUBLISHED,
+            featured=True,
+            current_stock=120,
+            stock_status=StockStatus.IN_STOCK,
+            average_review=Decimal("4.8"),
+            reviews_count=34,
+        ),
+        EcommerceProduct(
+            shop_id=shop.id,
+            name="Mango Dried Fruit 250g",
+            code="SNK-002",
+            slug="mango-dried-fruit-250g",
+            category_id=root_cat.id,
+            sub_category_id=sub_cat.id,
+            brand_id=brand.id,
+            unit_price=Decimal("12000"),
+            discount=Decimal("1500"),
+            discount_type=EcommerceDiscountType.FLAT,
+            thumbnail_url="https://images.unsplash.com/photo-1605027990121-475fd60a326f?w=400",
+            details="Naturally dried Ugandan mango slices.",
+            status=EcommerceProductStatus.PUBLISHED,
+            featured=False,
+            current_stock=200,
+            stock_status=StockStatus.IN_STOCK,
+            average_review=Decimal("4.2"),
+            reviews_count=8,
+        ),
+    ]
+    for p in products:
+        apply_create_audit(p, actor.id)
+        db.add(p)
+    await db.flush()
+
+    for p in products:
+        db.add(
+            EcommerceProductImage(
+                product_id=p.id,
+                url=p.thumbnail_url or "",
+                is_primary=True,
+                sort_order=0,
+                created_by=actor.id,
+                updated_by=actor.id,
+            )
+        )
+
+    featured = products[0]
+    db.add(
+        EcommerceBanner(
+            title="Shop Ugandan Snacks",
+            sub_title="Wholesale prices for your store",
+            button_text="Shop Now",
+            photo_url=featured.thumbnail_url or "",
+            background_color="#1a5632",
+            url=f"/products/details/{featured.slug}",
+            resource_type=EcommerceBannerResourceType.PRODUCT,
+            resource_id=featured.id,
+            is_published=True,
+            sort_order=0,
+            created_by=actor.id,
+            updated_by=actor.id,
+        )
+    )
 
 
 if __name__ == "__main__":

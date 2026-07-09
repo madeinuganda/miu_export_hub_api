@@ -9,27 +9,42 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.shared.database import get_db
+from app.core.shared.exceptions import AppError
 from app.core.export_hub.deps import get_current_supplier, get_supplier_org, require_approved_supplier, require_supplier_password_changed
 from app.models.shared.enums import DocumentStatus, ProductStatus, SenderRole, VerificationStatus
 from app.models.export_hub.misc import (
+    ExportChecklistDocument,
     ExportChecklistProgress,
     ExportChecklistTemplate,
     FileRecord,
     RegistrationDocument,
     SupplierRegistrationDraft,
 )
-from app.services.shared.file_storage import store_upload_file
+from app.services.shared.file_storage import store_upload_file, public_file_url
 from app.models.export_hub.accounts import SupplierNotification
 from app.models.export_hub.organizations import SupplierOrganization
-from app.models.export_hub.payments import PaymentEscrow
 from app.models.export_hub.orders import Order
 from app.models.export_hub.accounts import SupplierAccount, SupplierSession
 from app.services.export_hub.admin_service import AdminService
 from app.services.export_hub.catalog_service import CatalogService
+from app.services.export_hub.order_service import PIPELINE_STAGE_IDS, OrderService
+from app.services.export_hub.payment_service import PaymentService
+from app.schemas.export_hub.payment import SupplierPaymentsListResponse, SupplierPaymentsSummary
 from app.services.export_hub.rfq_service import RfqService, SubmitQuoteRequest
+from app.services.export_hub.storefront_service import StorefrontService
+from app.schemas.export_hub.storefront import (
+    CertificationCreate,
+    CertificationUpdate,
+    GalleryPhotoCreate,
+    GalleryPhotoUpdate,
+    StorefrontCertificationItem,
+    StorefrontGalleryItem,
+    StorefrontResponse,
+    StorefrontUpdate,
+)
 from app.utils.audit import apply_create_audit, apply_update_audit
 
-router = APIRouter(prefix="/supplier", tags=["supplier"])
+router = APIRouter(prefix="/supplier")
 
 
 class MessageBodyRequest(BaseModel):
@@ -364,7 +379,7 @@ async def create_product(
 ):
     from decimal import Decimal
     from app.core.shared.exceptions import AppError
-    from app.models.export_hub.catalog import Category, Product
+    from app.models.export_hub.catalog import Category, Product, ProductCertification
     from app.models.shared.enums import StockStatus
 
     raw_category_id = data.get("categoryId") or data.get("category_id")
@@ -400,7 +415,59 @@ async def create_product(
     apply_create_audit(p, account.id)
     db.add(p)
     await db.flush()
+
+    for name in data.get("certifications") or data.get("certs") or []:
+        label = str(name).strip()
+        if not label:
+            continue
+        cert = ProductCertification(product_id=p.id, certification_name=label)
+        apply_create_audit(cert, account.id)
+        db.add(cert)
+    await db.flush()
     return {"id": str(p.id)}
+
+
+@router.get("/products/{product_id}")
+async def supplier_product_detail(
+    product_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    _: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await CatalogService.supplier_product_detail(db, org.id, product_id)
+
+
+@router.put("/products/{product_id}")
+async def update_product(
+    product_id: UUID,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await CatalogService.update_supplier_product(db, org.id, account.id, product_id, data)
+
+
+@router.post("/products/{product_id}/images")
+async def upload_product_image(
+    product_id: UUID,
+    file: UploadFile = File(...),
+    is_primary: bool = Form(False),
+    sort_order: int = Form(0),
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    url = await CatalogService.upload_product_image(
+        db,
+        org.id,
+        account.id,
+        product_id,
+        file,
+        is_primary=is_primary,
+        sort_order=sort_order,
+    )
+    return {"url": url}
 
 
 @router.get("/rfqs")
@@ -408,15 +475,19 @@ async def supplier_rfqs(status: str | None = Query(None), db: AsyncSession = Dep
     return {"items": await RfqService.list_supplier_rfqs(db, org.id, status)}
 
 
+async def _supplier_owned_rfq(db: AsyncSession, org_id: UUID, public_id: str):
+    from app.models.export_hub.rfqs import Rfq
+    rfq = (await db.execute(select(Rfq).where(Rfq.public_id == public_id, Rfq.supplier_org_id == org_id))).scalar_one_or_none()
+    if not rfq:
+        raise AppError(404, "RFQ not found", "not_found")
+    return rfq
+
+
 @router.get("/rfqs/{public_id}")
 async def supplier_rfq_detail(public_id: str, db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier)):
-    from app.models.export_hub.rfqs import Rfq
-    rfq = (await db.execute(select(Rfq).where(Rfq.public_id == public_id, Rfq.supplier_org_id == org.id))).scalar_one_or_none()
-    if not rfq:
-        from app.core.shared.exceptions import AppError
-        raise AppError(404, "RFQ not found", "not_found")
+    rfq = await _supplier_owned_rfq(db, org.id, public_id)
     from app.models.export_hub.catalog import Product
-    from app.utils.formatting import format_quantity, format_ugx
+    from app.utils.formatting import format_quantity, format_relative_time, format_ugx
     product = await db.get(Product, rfq.product_id)
     st = await RfqService.supplier_inbox_status(rfq, db)
     return {
@@ -424,7 +495,7 @@ async def supplier_rfq_detail(public_id: str, db: AsyncSession = Depends(get_db)
         "product": product.name if product else "",
         "status": st,
         "sampleRequested": rfq.sample_requested,
-        "received": rfq.sent_at.date().isoformat() if rfq.sent_at else "",
+        "received": format_relative_time(rfq.sent_at),
         "buyer": "via MIU Admin",
         "destination": rfq.destination_port or "",
         "destinationFlag": "🌍",
@@ -436,8 +507,27 @@ async def supplier_rfq_detail(public_id: str, db: AsyncSession = Depends(get_db)
         "requiredBy": rfq.required_by_date.isoformat() if rfq.required_by_date else "",
         "certifications": [],
         "marketRequirements": rfq.message or "",
-        "messages": [],
+        "messages": await RfqService.list_messages_for_viewer(db, rfq.id, SenderRole.SUPPLIER),
     }
+
+
+@router.get("/rfqs/{public_id}/messages")
+async def supplier_rfq_messages(public_id: str, db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier)):
+    rfq = await _supplier_owned_rfq(db, org.id, public_id)
+    return {"messages": await RfqService.list_messages_for_viewer(db, rfq.id, SenderRole.SUPPLIER)}
+
+
+@router.post("/rfqs/{public_id}/messages")
+async def supplier_send_rfq_message(
+    public_id: str,
+    data: MessageBodyRequest,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(require_approved_supplier),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    rfq = await _supplier_owned_rfq(db, org.id, public_id)
+    await RfqService.add_message(db, rfq.id, SenderRole.SUPPLIER, data.body, account.id)
+    return {"ok": True}
 
 
 @router.post("/rfqs/{public_id}/quote")
@@ -445,62 +535,142 @@ async def submit_quote(public_id: str, data: SubmitQuoteRequest, db: AsyncSessio
     return await RfqService.submit_quote(db, org.id, account.id, public_id, data)
 
 
+@router.post("/rfqs/{public_id}/decline")
+async def supplier_decline_rfq(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(require_approved_supplier),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    from app.models.shared.enums import RfqStatus
+    rfq = await _supplier_owned_rfq(db, org.id, public_id)
+    rfq.status = RfqStatus.DECLINED
+    apply_update_audit(rfq, account.id)
+    return {"ok": True}
+
+
 @router.get("/orders/summary")
 async def orders_summary(db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier)):
-    count = (await db.execute(select(func.count()).select_from(Order).where(Order.supplier_org_id == org.id, Order.deleted_at.is_(None)))).scalar()
-    return {"active": count or 0, "pipeline": "2 in production, 1 awaiting shipment"}
+    from decimal import Decimal
+
+    from app.utils.formatting import format_ugx
+
+    orders = (
+        await db.execute(select(Order).where(Order.supplier_org_id == org.id, Order.deleted_at.is_(None)))
+    ).scalars().all()
+    stage_ids = [PIPELINE_STAGE_IDS[OrderService.order_pipeline_index(o)] for o in orders]
+    in_production = sum(1 for s in stage_ids if s == "in_production")
+    awaiting_shipment = sum(1 for s in stage_ids if s == "ready_to_dispatch")
+    active_orders = [o for i, o in enumerate(orders) if stage_ids[i] != "fulfilled"]
+    pipeline_value = sum((o.total_value_amount for o in active_orders), start=Decimal(0))
+    pipeline = f"{in_production} in production, {awaiting_shipment} awaiting shipment"
+    return {
+        "active": len(active_orders),
+        "pipeline": pipeline,
+        "pipelineValueDisplay": format_ugx(pipeline_value),
+    }
 
 
 @router.get("/orders")
 async def supplier_orders(status: str | None = None, q: str | None = None, db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier)):
-    from app.services.export_hub.order_service import OrderService
-    orders = (await db.execute(select(Order).where(Order.supplier_org_id == org.id, Order.deleted_at.is_(None)))).scalars().all()
+    orders = (
+        await db.execute(
+            select(Order).where(Order.supplier_org_id == org.id, Order.deleted_at.is_(None)).order_by(Order.created_at.desc())
+        )
+    ).scalars().all()
     items = []
     for o in orders:
-        if status and o.status.value != status:
+        item = await OrderService.serialize_supplier_order_listing(db, o)
+        if status and status != "all" and item["status"] != status:
             continue
-        items.append(await OrderService._serialize_order_listing(db, o, "active"))
+        if q and q.lower() not in item["product"].lower() and q.lower() not in item["id"].lower():
+            continue
+        items.append(item)
     return {"items": items}
 
 
-@router.put("/orders/{public_id}/status")
-async def update_order_status(public_id: str, status: str, db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier), account: SupplierAccount = Depends(require_supplier_password_changed)):
-    from app.models.shared.enums import OrderStatus
-    order = (await db.execute(select(Order).where(Order.public_id == public_id, Order.supplier_org_id == org.id))).scalar_one_or_none()
-    if order:
-        order.status = OrderStatus(status)
-        apply_update_audit(order, account.id)
+@router.get("/orders/{public_id}")
+async def supplier_order_detail(public_id: str, db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier)):
+    return await OrderService.get_supplier_order_detail(db, org.id, public_id)
+
+
+@router.post("/orders/{public_id}/advance")
+async def advance_supplier_order(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(require_approved_supplier),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    """Supplier-triggered transition: In Production -> Ready to Dispatch. Shipping and
+    payment release stages remain admin-controlled."""
+    return await OrderService.advance_supplier_order(db, org.id, public_id, account.id)
+
+
+async def _supplier_owned_order(db: AsyncSession, org_id: UUID, public_id: str) -> Order:
+    order = (await db.execute(select(Order).where(Order.public_id == public_id, Order.supplier_org_id == org_id))).scalar_one_or_none()
+    if not order:
+        raise AppError(404, "Order not found", "not_found")
+    return order
+
+
+@router.get("/orders/{public_id}/messages")
+async def supplier_order_messages(public_id: str, db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier)):
+    order = await _supplier_owned_order(db, org.id, public_id)
+    rfq_id = await RfqService.resolve_rfq_id_for_order(db, order)
+    return {"messages": await RfqService.list_messages_for_viewer(db, rfq_id, SenderRole.SUPPLIER)}
+
+
+@router.post("/orders/{public_id}/messages")
+async def supplier_send_order_message(
+    public_id: str,
+    data: MessageBodyRequest,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(require_approved_supplier),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    order = await _supplier_owned_order(db, org.id, public_id)
+    rfq_id = await RfqService.resolve_rfq_id_for_order(db, order)
+    await RfqService.add_message(db, rfq_id, SenderRole.SUPPLIER, data.body, account.id)
     return {"ok": True}
 
 
-@router.get("/payments/summary")
+@router.get("/payments/summary", response_model=SupplierPaymentsSummary)
 async def payments_summary(db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier)):
-    escrows = (
-        await db.execute(
-            select(PaymentEscrow)
-            .join(Order, Order.id == PaymentEscrow.order_id)
-            .where(Order.supplier_org_id == org.id, PaymentEscrow.deleted_at.is_(None))
-        )
-    ).scalars().all()
-    total = sum(e.total_amount for e in escrows)
-    return {"totalEscrow": f"UGX {int(total):,}", "upfrontReceived": "70%", "balancePending": "30%", "activeOrders": len(escrows)}
+    return await PaymentService.supplier_payments_summary(db, org.id)
 
 
-@router.get("/payments")
+@router.get("/payments", response_model=SupplierPaymentsListResponse)
 async def payments_list(db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier)):
-    return {"items": [], "tradeAssurance": {"upfrontPercent": 70, "balancePercent": 30}}
+    return await PaymentService.supplier_payments_list(db, org.id)
 
 
 @router.get("/export-checklist")
 async def export_checklist(db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(get_supplier_org)):
     templates = (await db.execute(select(ExportChecklistTemplate).where(ExportChecklistTemplate.deleted_at.is_(None)))).scalars().all()
     progress = (await db.execute(select(ExportChecklistProgress).where(ExportChecklistProgress.org_id == org.id))).scalars().all()
+    doc_rows = (
+        await db.execute(
+            select(ExportChecklistDocument, FileRecord)
+            .join(FileRecord, FileRecord.id == ExportChecklistDocument.file_id)
+            .where(ExportChecklistDocument.org_id == org.id, ExportChecklistDocument.deleted_at.is_(None))
+        )
+    ).all()
     prog_map = {p.item_key: p for p in progress}
+    doc_map = {d.item_key: (d, f) for d, f in doc_rows}
     sections: dict[str, list] = {}
     for t in templates:
         p = prog_map.get(t.item_key)
+        doc_entry = doc_map.get(t.item_key)
         sections.setdefault(t.section_id, []).append(
-            {"key": t.item_key, "title": t.title, "description": t.description, "required": t.required, "completed": p.completed if p else False}
+            {
+                "key": t.item_key,
+                "title": t.title,
+                "description": t.description,
+                "required": t.required,
+                "completed": p.completed if p else False,
+                "documentUrl": public_file_url(doc_entry[1].storage_key) if doc_entry else None,
+                "documentFilename": doc_entry[0].filename if doc_entry else None,
+            }
         )
     return {"sections": [{"id": k, "items": v} for k, v in sections.items()]}
 
@@ -518,6 +688,65 @@ async def toggle_checklist(item_key: str, completed: bool = True, db: AsyncSessi
         row.completed = completed
         row.completed_at = datetime.now(timezone.utc) if completed else None
     return {"ok": True}
+
+
+@router.post("/export-checklist/items/{item_key}/documents")
+async def upload_checklist_document(
+    item_key: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    record = await store_upload_file(
+        db,
+        file=file,
+        uploaded_by=account.id,
+        subdirectory=f"supplier/{org.id}/checklist/{item_key}",
+    )
+
+    doc = (
+        await db.execute(
+            select(ExportChecklistDocument).where(
+                ExportChecklistDocument.org_id == org.id,
+                ExportChecklistDocument.item_key == item_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if doc:
+        doc.file_id = record.id
+        doc.filename = file.filename
+        apply_update_audit(doc, account.id)
+    else:
+        doc = ExportChecklistDocument(org_id=org.id, item_key=item_key, file_id=record.id, filename=file.filename)
+        apply_create_audit(doc, account.id)
+        db.add(doc)
+
+    # Uploading a supporting document also marks the checklist item complete.
+    progress = (
+        await db.execute(
+            select(ExportChecklistProgress).where(
+                ExportChecklistProgress.org_id == org.id,
+                ExportChecklistProgress.item_key == item_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if not progress:
+        progress = ExportChecklistProgress(
+            org_id=org.id, item_key=item_key, completed=True, completed_at=datetime.now(timezone.utc)
+        )
+        apply_create_audit(progress, account.id)
+        db.add(progress)
+    else:
+        progress.completed = True
+        progress.completed_at = datetime.now(timezone.utc)
+
+    return {
+        "itemKey": item_key,
+        "filename": file.filename,
+        "fileId": str(record.id),
+        "url": public_file_url(record.storage_key),
+    }
 
 
 @router.get("/export-checklist/readiness")
@@ -552,15 +781,116 @@ async def update_company_profile(data: dict, org: SupplierOrganization = Depends
     return {"ok": True}
 
 
-@router.get("/storefront")
-async def get_storefront(org: SupplierOrganization = Depends(get_supplier_org)):
-    return {"published": org.storefront_published, "slug": org.slug}
+@router.get("/storefront", response_model=StorefrontResponse)
+async def get_storefront(
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+):
+    return await StorefrontService.get_storefront(db, org)
 
 
-@router.put("/storefront")
-async def put_storefront(published: bool = True, org: SupplierOrganization = Depends(require_approved_supplier), account: SupplierAccount = Depends(require_supplier_password_changed)):
-    org.storefront_published = published
-    return {"published": published}
+@router.put("/storefront", response_model=StorefrontResponse)
+async def put_storefront(
+    data: StorefrontUpdate,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await StorefrontService.update_storefront(db, org, account, data)
+
+
+@router.patch("/storefront/publish", response_model=StorefrontResponse)
+async def publish_storefront(
+    published: bool = True,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(require_approved_supplier),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await StorefrontService.set_published(db, org, account, published)
+
+
+@router.post("/storefront/banner", response_model=StorefrontResponse)
+async def upload_storefront_banner(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await StorefrontService.upload_banner(db, org, account, file)
+
+
+@router.post("/storefront/logo", response_model=StorefrontResponse)
+async def upload_storefront_logo(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await StorefrontService.upload_logo(db, org, account, file)
+
+
+@router.post("/storefront/certifications", response_model=StorefrontCertificationItem)
+async def create_storefront_certification(
+    data: CertificationCreate,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await StorefrontService.create_certification(db, org, account, data)
+
+
+@router.patch("/storefront/certifications/{cert_id}", response_model=StorefrontCertificationItem)
+async def update_storefront_certification(
+    cert_id: UUID,
+    data: CertificationUpdate,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await StorefrontService.update_certification(db, org, account, cert_id, data)
+
+
+@router.delete("/storefront/certifications/{cert_id}")
+async def delete_storefront_certification(
+    cert_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    await StorefrontService.delete_certification(db, org, account, cert_id)
+    return {"ok": True}
+
+
+@router.post("/storefront/gallery", response_model=StorefrontGalleryItem)
+async def create_storefront_gallery_photo(
+    data: GalleryPhotoCreate,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await StorefrontService.create_gallery_photo(db, org, account, data)
+
+
+@router.patch("/storefront/gallery/{photo_id}", response_model=StorefrontGalleryItem)
+async def update_storefront_gallery_photo(
+    photo_id: UUID,
+    data: GalleryPhotoUpdate,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    return await StorefrontService.update_gallery_photo(db, org, account, photo_id, data)
+
+
+@router.delete("/storefront/gallery/{photo_id}")
+async def delete_storefront_gallery_photo(
+    photo_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    await StorefrontService.delete_gallery_photo(db, org, account, photo_id)
+    return {"ok": True}
 
 
 @router.get("/notifications")
@@ -592,18 +922,16 @@ async def mark_read(notif_id: UUID, db: AsyncSession = Depends(get_db), account:
 
 
 @router.get("/notifications/summary")
-async def supplier_notif_summary(account: SupplierAccount = Depends(require_supplier_password_changed), db: AsyncSession = Depends(get_db)):
-    unread = (
-        await db.execute(
-            select(func.count())
-            .select_from(SupplierNotification)
-            .where(
-                SupplierNotification.supplier_account_id == account.id,
-                SupplierNotification.read_at.is_(None),
-            )
-        )
-    ).scalar()
-    return {"total": unread or 3, "rfq": 1, "orders": 1, "messages": 1}
+async def supplier_notif_summary(
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+):
+    from app.models.shared.enums import VerificationStatus
+    from app.services.export_hub.nav_badges_service import NavBadgesService
+
+    if org.verification_status != VerificationStatus.APPROVED:
+        return {"total": 0, "rfq": 0, "orders": 0, "messages": 0, "payments": 0}
+    return await NavBadgesService.supplier_badges(db, org.id)
 
 
 @router.get("/search")
@@ -611,41 +939,3 @@ async def supplier_search(q: str = Query(...)):
     return {"query": q, "results": []}
 
 
-@router.get("/conversations/miu-admin")
-async def supplier_chat(db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(get_supplier_org)):
-    from app.models.shared.enums import ConversationType
-    from app.models.export_hub.messaging import ConversationMessage, ConversationThread
-    thread = (
-        await db.execute(
-            select(ConversationThread).where(
-                ConversationThread.supplier_org_id == org.id, ConversationThread.thread_type == ConversationType.SUPPLIER_MIU
-            )
-        )
-    ).scalar_one_or_none()
-    if not thread:
-        return {"messages": []}
-    msgs = (await db.execute(select(ConversationMessage).where(ConversationMessage.thread_id == thread.id).order_by(ConversationMessage.sent_at))).scalars().all()
-    return {"messages": [{"id": str(m.id), "from": m.sender_role.value, "body": m.body, "time": m.sent_at.isoformat()} for m in msgs]}
-
-
-@router.post("/conversations/miu-admin/messages")
-async def supplier_send_msg(
-    data: MessageBodyRequest,
-    db: AsyncSession = Depends(get_db),
-    org: SupplierOrganization = Depends(get_supplier_org),
-    account: SupplierAccount = Depends(require_supplier_password_changed),
-):
-    from app.models.shared.enums import ConversationType
-    from app.models.export_hub.messaging import ConversationMessage, ConversationThread
-    thread = (
-        await db.execute(select(ConversationThread).where(ConversationThread.supplier_org_id == org.id, ConversationThread.thread_type == ConversationType.SUPPLIER_MIU))
-    ).scalar_one_or_none()
-    if not thread:
-        thread = ConversationThread(thread_type=ConversationType.SUPPLIER_MIU, supplier_org_id=org.id, subject="MIU Admin")
-        apply_create_audit(thread, account.id)
-        db.add(thread)
-        await db.flush()
-    msg = ConversationMessage(thread_id=thread.id, sender_role=SenderRole.SUPPLIER, body=data.body, sent_at=datetime.now(timezone.utc))
-    apply_create_audit(msg, account.id)
-    db.add(msg)
-    return {"ok": True}

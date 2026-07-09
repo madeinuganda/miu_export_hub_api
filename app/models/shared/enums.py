@@ -106,16 +106,25 @@ class PaymentMilestoneStatus(str, enum.Enum):
     RELEASED = "released"
 
 
-class ConversationType(str, enum.Enum):
-    BUYER_MIU = "buyer_miu"
-    SUPPLIER_MIU = "supplier_miu"
-
-
 class SenderRole(str, enum.Enum):
     BUYER = "buyer"
     SUPPLIER = "supplier"
     ADMIN = "admin"
     SYSTEM = "system"
+
+
+class MessageReviewStatus(str, enum.Enum):
+    """Moderation state of a buyer/supplier RFQ or deal message.
+
+    Buyer- and supplier-authored messages are never shown to the other party
+    until MIU Admin explicitly routes them. Admin- and system-authored
+    messages are considered already reviewed (ROUTED) the moment they're
+    created.
+    """
+
+    PENDING = "pending"
+    ROUTED = "routed"
+    REVERTED = "reverted"
 
 
 class DocumentStatus(str, enum.Enum):
@@ -177,3 +186,21 @@ class EcommercePaymentMethod(str, enum.Enum):
     PESAPAL = "pesapal"
     OFFLINE = "offline_payment"
     WALLET = "pay_by_wallet"
+
+
+class EcommerceCouponType(str, enum.Enum):
+    DISCOUNT_ON_PURCHASE = "discount_on_purchase"
+    FIRST_ORDER = "first_order"
+    FREE_DELIVERY = "free_delivery"
+
+
+class EcommerceWalletTransactionType(str, enum.Enum):
+    ADD_FUND = "add_fund"
+    ORDER_PLACE = "order_place"
+    ORDER_REFUND = "order_refund"
+    ADD_FUND_BY_ADMIN = "add_fund_by_admin"
+
+
+class EcommercePaymentPurpose(str, enum.Enum):
+    ORDER_CHECKOUT = "order_checkout"
+    WALLET_TOPUP = "wallet_topup"

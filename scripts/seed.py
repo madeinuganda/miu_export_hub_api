@@ -14,8 +14,8 @@ from app.core.shared.security import hash_password
 from app.models import *  # noqa: F401, F403
 from app.models.export_hub.catalog import Category, Product, ProductBadge, ProductImage, ProductCertification, PlatformStat
 from app.models.shared.enums import (
-    ConversationType,
     EscrowStatus,
+    MessageReviewStatus,
     MilestoneState,
     OrderStatus,
     OrgMemberRole,
@@ -39,11 +39,18 @@ from app.models.export_hub.marketplace import (
     CmsTradeCta,
     CmsTrustItem,
 )
-from app.models.export_hub.messaging import ConversationMessage, ConversationThread
 from app.models.export_hub.accounts import AdminAccount, BuyerAccount, BuyerNotification, BuyerPreference, SupplierAccount, SupplierNotification
 from app.models.export_hub.misc import ExportChecklistTemplate
 from app.models.export_hub.orders import Order, OrderActivity, OrderMilestone, OrderTracking
-from app.models.export_hub.organizations import BuyerOrganization, BuyerOrganizationMember, SupplierOrganization, SupplierOrganizationMember
+from app.models.export_hub.organizations import (
+    BuyerOrganization,
+    BuyerOrganizationMember,
+    SupplierCertification,
+    SupplierGalleryPhoto,
+    SupplierOrganization,
+    SupplierOrganizationMember,
+)
+from app.models.shared.enums import CertificationStatus
 from app.models.export_hub.payments import PaymentEscrow, PaymentMilestone
 from app.models.export_hub.rfqs import Rfq, RfqQuote
 from app.utils.audit import apply_create_audit
@@ -90,6 +97,7 @@ async def seed() -> None:
         ).scalar_one_or_none():
             await seed_ecommerce_accounts(db, admin)
             await seed_ecommerce_catalog(db, admin)
+            await seed_ecommerce_promotions(db, admin)
             await db.commit()
             print("Admin: admin@miu.ug / MIU@2026 (password synced). Demo data already present.")
             print("  E-Commerce Admin:    shop-admin@miu.ug / ShopAdmin123!")
@@ -223,7 +231,16 @@ async def seed() -> None:
             category="Coffee & Tea",
             region="Western",
             district="Kasese",
-            tagline="Premium organic exports from the Rwenzori foothills",
+            tagline="Farm-to-table Ugandan exports, certified and traceable.",
+            website="www.rwenzoriorganics.co.ug",
+            short_description=(
+                "Exporter of premium Uganda Arabica coffee, vanilla, and moringa products. "
+                "Direct farm-to-buyer. All products sourced from smallholder farmers in the "
+                "Rwenzori foothills, certified organic and sustainably grown."
+            ),
+            established_year=2018,
+            team_size="11–50",
+            export_markets="Europe, Middle East, North America",
             verification_status=VerificationStatus.APPROVED,
             approved_at=datetime.now(timezone.utc),
             storefront_published=True,
@@ -240,6 +257,38 @@ async def seed() -> None:
                 updated_by=supplier_account.id,
             )
         )
+        for idx, (name, status) in enumerate(
+            [
+                ("Uganda National Bureau of Standards", CertificationStatus.VERIFIED),
+                ("Organic Certification — UNBS/EU", CertificationStatus.VERIFIED),
+                ("Rainforest Alliance Certified", CertificationStatus.PENDING_REVIEW),
+                ("USDA NOP Certified", CertificationStatus.VERIFIED),
+            ]
+        ):
+            cert = SupplierCertification(
+                org_id=supplier_org.id,
+                name=name,
+                status=status,
+                sort_order=idx,
+            )
+            apply_create_audit(cert, supplier_account.id)
+            db.add(cert)
+        for idx, (url, caption) in enumerate(
+            [
+                ("https://images.unsplash.com/photo-1447933601403-0c6688de566e?w=800", "Coffee harvest"),
+                ("https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?w=800", "Roastery"),
+                ("https://images.unsplash.com/photo-1514432324607-a09d9b4aefdd?w=800", "Brewing"),
+                ("https://images.unsplash.com/photo-1464226189744-3d750af938ad?w=800", "Farm visit"),
+            ]
+        ):
+            photo = SupplierGalleryPhoto(
+                org_id=supplier_org.id,
+                image_url=url,
+                caption=caption,
+                sort_order=idx,
+            )
+            apply_create_audit(photo, supplier_account.id)
+            db.add(photo)
 
         elgon = SupplierOrganization(
             name="Elgon Coffee Exporters Ltd",
@@ -318,6 +367,7 @@ async def seed() -> None:
             tone="coffee",
             rating=Decimal("5.0"),
             review_count=127,
+            featured=True,
             created_by=admin.id,
             updated_by=admin.id,
         )
@@ -343,6 +393,18 @@ async def seed() -> None:
         )
         db.add(vanilla)
         await db.flush()
+        db.add(
+            ProductImage(
+                product_id=vanilla.id,
+                url="https://images.unsplash.com/photo-1596040033229-a0b709c3c63c?w=800&h=600&fit=crop",
+                is_primary=True,
+                sort_order=0,
+                created_by=supplier_account.id,
+                updated_by=supplier_account.id,
+            )
+        )
+        db.add(ProductCertification(product_id=vanilla.id, certification_name="Organic", created_by=supplier_account.id, updated_by=supplier_account.id))
+        db.add(ProductCertification(product_id=vanilla.id, certification_name="Fair Trade", created_by=supplier_account.id, updated_by=supplier_account.id))
 
         db.add(
             CmsHero(
@@ -371,11 +433,60 @@ async def seed() -> None:
         db.add(PlatformStat(key="countries", headline="48", subtext="Countries reached", icon_key="globe", sort_order=0, created_by=admin.id, updated_by=admin.id))
 
         for section, items in [
-            ("registration", [("business_license", "Business License"), ("export_permit", "Export Permit")]),
-            ("documentation", [("invoice_template", "Commercial Invoice Template")]),
+            (
+                "business",
+                [
+                    ("cert-incorporation", "Certificate of Incorporation", "Issued by URSB — must be valid and not expired", True),
+                    ("tin", "Tax Identification Number (TIN)", "URA-issued TIN certificate", True),
+                    ("vat", "VAT Registration (if applicable)", "Required if annual turnover exceeds UGX 150M", False),
+                ],
+            ),
+            (
+                "quality",
+                [
+                    ("unbs", "UNBS Quality Mark Certificate", "Cross-checked against UNBS registry. Photos alone are not accepted", True),
+                    ("made-in-uganda", "Made-in-Uganda Registration", "Certificate from MTIC confirming local origin", True),
+                    ("haccp", "HACCP Compliance Certificate", "Required for processed food exports to EU", True),
+                    ("iso22000", "ISO 22000 (Food Safety Management)", "Strongly recommended for EU and US markets", False),
+                ],
+            ),
+            (
+                "export-docs",
+                [
+                    ("export-license", "Export License", "Issued by Ministry of Trade — required for all exports", True),
+                    ("phytosanitary", "Phytosanitary Certificate", "Issued by MAARD — required for agricultural products", True),
+                    ("cert-origin", "Certificate of Origin", "Chamber of Commerce — confirms Ugandan origin", False),
+                    ("fumigation", "Fumigation Certificate", "Required for certain commodities and destinations", False),
+                ],
+            ),
+            (
+                "product-testing",
+                [
+                    ("lab-results", "Third-Party Lab Test Results", "Microbial and heavy-metal screening for food exports", False),
+                    ("moisture-test", "Moisture Content Certificate", "Required for dried agricultural products", False),
+                    ("pesticide-residue", "Pesticide Residue Report", "EU MRL compliance for coffee, vanilla, and herbs", False),
+                ],
+            ),
+            (
+                "labelling",
+                [
+                    ("export-label", "Export Label Design Approved", "Labels must include product name, weight, origin, allergens, expiry", True),
+                    ("packaging-spec", "Packaging Specifications", "Export-grade packaging meeting buyer and transit requirements", True),
+                ],
+            ),
         ]:
-            for key, title in items:
-                db.add(ExportChecklistTemplate(section_id=section, item_key=key, title=title, required=True, created_by=admin.id, updated_by=admin.id))
+            for key, title, description, required in items:
+                db.add(
+                    ExportChecklistTemplate(
+                        section_id=section,
+                        item_key=key,
+                        title=title,
+                        description=description,
+                        required=required,
+                        created_by=admin.id,
+                        updated_by=admin.id,
+                    )
+                )
 
         rfq_new = Rfq(
             public_id="RFQ-2026-0042",
@@ -469,11 +580,107 @@ async def seed() -> None:
         db.add(OrderTracking(order_id=order.id, tracking_number="MSKU1234567", carrier="Maersk", eta_date=date.today() + timedelta(days=14), created_by=admin.id, updated_by=admin.id))
         escrow = PaymentEscrow(order_id=order.id, total_amount=Decimal("32190000"), upfront_amount=Decimal("22533000"), balance_amount=Decimal("9657000"), status=EscrowStatus.UPFRONT_RECEIVED, created_by=admin.id, updated_by=admin.id)
         db.add(escrow)
-
-        buyer_thread = ConversationThread(thread_type=ConversationType.BUYER_MIU, buyer_org_id=buyer_org.id, subject="MIU Account Manager", created_by=buyer_account.id, updated_by=buyer_account.id)
-        db.add(buyer_thread)
         await db.flush()
-        db.add(ConversationMessage(thread_id=buyer_thread.id, sender_role=SenderRole.ADMIN, body="Welcome to MIU! Your account manager is here to help.", sent_at=datetime.now(timezone.utc), created_by=admin.id, updated_by=admin.id))
+        db.add(
+            PaymentMilestone(
+                escrow_id=escrow.id,
+                milestone_type="upfront",
+                amount=Decimal("22533000"),
+                status=PaymentMilestoneStatus.RECEIVED,
+                created_by=admin.id,
+                updated_by=admin.id,
+            )
+        )
+        db.add(
+            PaymentMilestone(
+                escrow_id=escrow.id,
+                milestone_type="balance",
+                amount=Decimal("9657000"),
+                status=PaymentMilestoneStatus.PENDING,
+                created_by=admin.id,
+                updated_by=admin.id,
+            )
+        )
+
+        # Demo admin-relayed message thread on rfq1 / MIU-ORD-2026-001, showing
+        # routed, reverted, and still-pending moderation states.
+        db.add(
+            RfqMessage(
+                rfq_id=rfq1.id,
+                sender_role=SenderRole.BUYER,
+                body="Can you confirm the harvest date and moisture content for this lot?",
+                sent_at=datetime.now(timezone.utc) - timedelta(days=4, hours=2),
+                review_status=MessageReviewStatus.ROUTED,
+                reviewed_at=datetime.now(timezone.utc) - timedelta(days=4, hours=1),
+                reviewed_by=admin.id,
+                created_by=buyer_account.id,
+                updated_by=admin.id,
+            )
+        )
+        db.add(
+            RfqMessage(
+                rfq_id=rfq1.id,
+                sender_role=SenderRole.SUPPLIER,
+                body="Harvested early March, moisture tested at 11.2%. Certificate available on request.",
+                sent_at=datetime.now(timezone.utc) - timedelta(days=3, hours=20),
+                review_status=MessageReviewStatus.ROUTED,
+                reviewed_at=datetime.now(timezone.utc) - timedelta(days=3, hours=18),
+                reviewed_by=admin.id,
+                created_by=supplier_account.id,
+                updated_by=admin.id,
+            )
+        )
+        db.add(
+            RfqMessage(
+                rfq_id=rfq1.id,
+                sender_role=SenderRole.BUYER,
+                body="Also please share your direct WhatsApp number for faster updates.",
+                sent_at=datetime.now(timezone.utc) - timedelta(days=3, hours=10),
+                review_status=MessageReviewStatus.REVERTED,
+                reviewed_at=datetime.now(timezone.utc) - timedelta(days=3, hours=9),
+                reviewed_by=admin.id,
+                revert_note="For your protection, direct contact details can't be shared until the order is fulfilled. Please route any updates through MIU Admin.",
+                created_by=buyer_account.id,
+                updated_by=admin.id,
+            )
+        )
+        db.add(
+            RfqMessage(
+                rfq_id=rfq1.id,
+                sender_role=SenderRole.BUYER,
+                body="Understood — please just confirm the CIF Hamburg ETA once shipped.",
+                sent_at=datetime.now(timezone.utc) - timedelta(days=2, hours=20),
+                review_status=MessageReviewStatus.ROUTED,
+                reviewed_at=datetime.now(timezone.utc) - timedelta(days=2, hours=19),
+                reviewed_by=admin.id,
+                created_by=buyer_account.id,
+                updated_by=admin.id,
+            )
+        )
+        db.add(
+            RfqMessage(
+                rfq_id=rfq1.id,
+                sender_role=SenderRole.SUPPLIER,
+                body="Confirmed — ETA Hamburg is 14 days from dispatch. Tracking shared with MIU Admin.",
+                sent_at=datetime.now(timezone.utc) - timedelta(hours=6),
+                review_status=MessageReviewStatus.ROUTED,
+                reviewed_at=datetime.now(timezone.utc) - timedelta(hours=5),
+                reviewed_by=admin.id,
+                created_by=supplier_account.id,
+                updated_by=admin.id,
+            )
+        )
+        db.add(
+            RfqMessage(
+                rfq_id=rfq1.id,
+                sender_role=SenderRole.SUPPLIER,
+                body="Also checking in — any update on the next PO volume for Q3?",
+                sent_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                review_status=MessageReviewStatus.PENDING,
+                created_by=supplier_account.id,
+                updated_by=supplier_account.id,
+            )
+        )
 
         db.add(
             BuyerNotification(
@@ -500,6 +707,7 @@ async def seed() -> None:
 
         await seed_ecommerce_accounts(db, admin)
         await seed_ecommerce_catalog(db, admin)
+        await seed_ecommerce_promotions(db, admin)
         await db.commit()
         print("Seed complete.")
         print("  Export Hub Admin:  admin@miu.ug / MIU@2026")
@@ -510,6 +718,8 @@ async def seed() -> None:
 
 
 async def seed_ecommerce_accounts(db: AsyncSession, actor: AdminAccount) -> None:
+    from decimal import Decimal
+
     from app.models.ecommerce.accounts import CustomerAccount, EcommerceAdminAccount
     from app.models.shared.enums import CustomerType, EcommerceAccountType, Platform
     from app.models.shared.rbac import AccountRoleAssignment, Role
@@ -577,6 +787,7 @@ async def seed_ecommerce_accounts(db: AsyncSession, actor: AdminAccount) -> None
         customer_type=CustomerType.RETAIL,
         is_active=True,
         email_verified_at=datetime.now(timezone.utc),
+        wallet_balance=Decimal("500000"),
     )
     apply_create_audit(retail_customer, actor.id)
     db.add(retail_customer)
@@ -630,6 +841,24 @@ async def seed_ecommerce_catalog(db: AsyncSession, actor: AdminAccount) -> None:
     apply_create_audit(shop, actor.id)
     db.add(shop)
     await db.flush()
+
+    from app.models.ecommerce.shipping_config import EcommerceShopShippingMethod
+
+    for code, title, cost in (
+        ("flat_standard", "Standard Delivery", Decimal("5000")),
+        ("flat_express", "Express Delivery", Decimal("12000")),
+    ):
+        db.add(
+            EcommerceShopShippingMethod(
+                shop_id=shop.id,
+                code=code,
+                title=title,
+                duration="2-5 business days" if code == "flat_standard" else "1-2 business days",
+                cost=cost,
+                created_by=actor.id,
+                updated_by=actor.id,
+            )
+        )
 
     root_cat = EcommerceCategory(
         name="Packaged Foods",
@@ -754,6 +983,60 @@ async def seed_ecommerce_catalog(db: AsyncSession, actor: AdminAccount) -> None:
             updated_by=actor.id,
         )
     )
+
+
+async def seed_ecommerce_promotions(db: AsyncSession, actor: AdminAccount) -> None:
+    from datetime import date, timedelta
+    from decimal import Decimal
+
+    from app.models.ecommerce.accounts import CustomerAccount, EcommerceShop
+    from app.models.ecommerce.promotions import EcommerceCoupon
+    from app.models.shared.enums import EcommerceCouponType, EcommerceDiscountType
+
+    if (
+        await db.execute(
+            select(EcommerceCoupon).where(
+                EcommerceCoupon.code == "WELCOME10",
+                EcommerceCoupon.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none():
+        pass
+    else:
+        shop = (
+            await db.execute(
+                select(EcommerceShop).where(EcommerceShop.deleted_at.is_(None)).limit(1)
+            )
+        ).scalar_one_or_none()
+        today = date.today()
+        coupon = EcommerceCoupon(
+            title="Welcome 10% Off",
+            code="WELCOME10",
+            coupon_type=EcommerceCouponType.DISCOUNT_ON_PURCHASE,
+            discount_type=EcommerceDiscountType.PERCENT,
+            discount=Decimal("10"),
+            min_purchase=Decimal("5000"),
+            shop_id=shop.id if shop else None,
+            start_date=today - timedelta(days=30),
+            expire_date=today + timedelta(days=365),
+            usage_limit=5,
+            total_limit=1000,
+            is_active=True,
+        )
+        apply_create_audit(coupon, actor.id)
+        db.add(coupon)
+
+    retail = (
+        await db.execute(
+            select(CustomerAccount).where(
+                CustomerAccount.email == "retail@example.com",
+                CustomerAccount.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if retail and retail.wallet_balance < Decimal("100000"):
+        retail.wallet_balance = Decimal("500000")
+        retail.updated_by = actor.id
 
 
 if __name__ == "__main__":

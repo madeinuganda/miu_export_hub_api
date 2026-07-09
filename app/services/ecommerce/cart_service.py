@@ -337,6 +337,11 @@ class EcommerceCartService:
                     "name": "Pesapal",
                     "enabled": settings.pesapal_enabled,
                 },
+                {
+                    "code": "pay_by_wallet",
+                    "name": "Pay by Wallet",
+                    "enabled": settings.ecommerce_wallet_enabled and not owner.is_guest,
+                },
             ],
         }
 

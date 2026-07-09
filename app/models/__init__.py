@@ -23,6 +23,8 @@ from app.models.export_hub.organizations import (
     SupplierGalleryPhoto,
 )
 from app.models.export_hub.catalog import Category, Product, ProductImage, ProductCertification, ProductBadge, PlatformStat
+from app.models.export_hub.reviews import ExportHubProductReview
+from app.models.export_hub.browse_settings import ExportHubBrowseSettings
 from app.models.export_hub.marketplace import (
     CmsSiteSettings,
     CmsHero,
@@ -39,7 +41,7 @@ from app.models.export_hub.marketplace import (
 from app.models.export_hub.rfqs import Rfq, RfqQuote, RfqMessage
 from app.models.export_hub.orders import Order, OrderMilestone, OrderActivity, OrderTracking, OrderDocument
 from app.models.export_hub.payments import PaymentEscrow, PaymentMilestone, PaymentLink
-from app.models.export_hub.messaging import ConversationThread, ConversationMessage, MessageAttachment
+from app.models.export_hub.messaging import MessageAttachment
 from app.models.export_hub.misc import (
     BuyerSavedSupplier,
     FileRecord,
@@ -49,6 +51,7 @@ from app.models.export_hub.misc import (
     RegistrationDocument,
     ExportChecklistTemplate,
     ExportChecklistProgress,
+    ExportChecklistDocument,
     AdminActionLog,
 )
 from app.models.shared.rbac import AccountRoleAssignment, Permission, Role, RolePermission
@@ -126,8 +129,6 @@ __all__ = [
     "PaymentEscrow",
     "PaymentMilestone",
     "PaymentLink",
-    "ConversationThread",
-    "ConversationMessage",
     "MessageAttachment",
     "BuyerSavedSupplier",
     "FileRecord",

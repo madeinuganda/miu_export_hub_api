@@ -24,6 +24,7 @@ class DigitalPaymentRequest(BaseModel):
     payer_email: str | None = None
     payer_name: str | None = None
     payer_phone: str | None = None
+    coupon_code: str | None = None
 
 
 class PlaceOrderResponse(BaseModel):

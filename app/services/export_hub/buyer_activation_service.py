@@ -65,14 +65,19 @@ class BuyerActivationService:
                 )
             )
         ).scalar_one_or_none()
-        if not row or row.used_at:
+        if not row:
             raise AppError(400, "Activation link is invalid or already used", "invalid_token")
-        if row.expires_at < datetime.now(timezone.utc):
-            raise AppError(400, "Activation link has expired", "token_expired")
 
         account = await db.get(BuyerAccount, row.buyer_account_id)
         if not account or account.deleted_at or not account.is_active:
             raise AppError(400, "Account not found", "invalid_token")
+
+        if row.used_at:
+            if account.email_verified_at:
+                return account
+            raise AppError(400, "Activation link is invalid or already used", "invalid_token")
+        if row.expires_at < datetime.now(timezone.utc):
+            raise AppError(400, "Activation link has expired", "token_expired")
 
         account.email_verified_at = datetime.now(timezone.utc)
         apply_update_audit(account, account.id)

@@ -6,12 +6,36 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
 from app.core.shared.config import get_settings
 from app.core.shared.exceptions import AppError, app_error_handler, validation_error_handler
 
 settings = get_settings()
+
+OPENAPI_TAGS = [
+    {"name": "Export Hub · Auth", "description": "B2B authentication"},
+    {"name": "Export Hub · Public", "description": "B2B public marketplace content"},
+    {"name": "Export Hub · Buyer Onboarding", "description": "Buyer registration and verification"},
+    {"name": "Export Hub · Buyer", "description": "Buyer accounts, RFQs, and orders"},
+    {"name": "Export Hub · Supplier", "description": "Supplier accounts and catalog"},
+    {"name": "Export Hub · Admin", "description": "Export Hub back-office"},
+    {"name": "E-Commerce · Auth", "description": "Retail customer, seller, and shop admin auth"},
+    {"name": "E-Commerce · Catalog", "description": "Products, categories, brands"},
+    {"name": "E-Commerce · Cart", "description": "Shopping cart"},
+    {"name": "E-Commerce · Checkout", "description": "Checkout preview"},
+    {"name": "E-Commerce · Shipping", "description": "Shipping method selection"},
+    {"name": "E-Commerce · Orders", "description": "Customer orders and payments"},
+    {"name": "E-Commerce · Coupons", "description": "Coupon apply and list"},
+    {"name": "E-Commerce · Wallet", "description": "Customer wallet balance and top-up"},
+    {"name": "E-Commerce · Addresses", "description": "Guest and customer shipping addresses"},
+    {"name": "E-Commerce · Seller", "description": "Vendor order management"},
+    {"name": "E-Commerce · Admin", "description": "Shop admin orders, catalog, vendors, wallet"},
+    {"name": "E-Commerce · Reviews & Notifications", "description": "Product reviews and customer notifications"},
+    {"name": "Shared · Platforms", "description": "Platform discovery"},
+    {"name": "Shared · Notifications", "description": "Cross-platform notifications"},
+]
 
 
 @asynccontextmanager
@@ -36,6 +60,7 @@ app = FastAPI(
     ),
     version="0.2.0",
     lifespan=lifespan,
+    openapi_tags=OPENAPI_TAGS,
     swagger_ui_parameters={"persistAuthorization": True},
 )
 
@@ -50,6 +75,10 @@ app.add_middleware(
 app.add_exception_handler(AppError, app_error_handler)
 app.add_exception_handler(RequestValidationError, validation_error_handler)
 app.include_router(api_router)
+
+uploads_path = Path(settings.storage_path)
+uploads_path.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(uploads_path)), name="uploads")
 
 
 @app.get("/health")

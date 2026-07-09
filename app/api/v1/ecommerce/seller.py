@@ -11,7 +11,7 @@ from app.models.ecommerce.accounts import SellerAccount
 from app.schemas.ecommerce.seller import SellerOrderStatusUpdateRequest
 from app.services.ecommerce.seller_order_service import EcommerceSellerOrderService
 
-router = APIRouter(prefix="/seller", tags=["E-Commerce · Seller"])
+router = APIRouter(prefix="/seller")
 
 
 @router.get("/orders/list")

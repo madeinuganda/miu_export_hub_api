@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fastapi import UploadFile
+
+from app.core.shared.config import get_settings
 from app.core.shared.exceptions import AppError
 from app.models.export_hub.accounts import AdminAccount
 from app.models.export_hub.catalog import Category, Product
 from app.schemas.export_hub.catalog import CategoryCreate, CategoryItem, CategoryListResponse, CategoryUpdate
+from app.services.shared.file_storage import public_file_url, store_upload_bytes
+from app.services.shared.image_processing import make_thumbnail
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
 
 
@@ -79,6 +85,7 @@ class CategoryService:
             parent_id=category.parent_id,
             sort_order=category.sort_order,
             is_active=category.is_active,
+            featured=category.featured,
             image_url=category.image_url,
             thumb_url=category.thumb_url,
             product_count=await CategoryService._product_count(db, category.id),
@@ -117,12 +124,14 @@ class CategoryService:
             parent_id=data.parent_id,
             sort_order=data.sort_order,
             is_active=data.is_active,
+            featured=data.featured,
             image_url=data.image_url,
             thumb_url=data.thumb_url,
         )
         apply_create_audit(category, admin.id)
         db.add(category)
         await db.flush()
+        await db.refresh(category)
         return await CategoryService._to_item(db, category)
 
     @staticmethod
@@ -162,6 +171,8 @@ class CategoryService:
             category.sort_order = updates["sort_order"]
         if "is_active" in updates and updates["is_active"] is not None:
             category.is_active = updates["is_active"]
+        if "featured" in updates and updates["featured"] is not None:
+            category.featured = updates["featured"]
         if "image_url" in updates:
             category.image_url = updates["image_url"]
         if "thumb_url" in updates:
@@ -169,6 +180,77 @@ class CategoryService:
 
         apply_update_audit(category, admin.id)
         await db.flush()
+        await db.refresh(category)
+        return await CategoryService._to_item(db, category)
+
+    @staticmethod
+    async def upload_category_image(
+        db: AsyncSession,
+        admin: AdminAccount,
+        category_id: UUID,
+        file: UploadFile,
+        *,
+        kind: str,
+    ) -> CategoryItem:
+        if kind not in {"image", "thumb"}:
+            raise AppError(400, "Invalid image kind", "invalid_kind")
+
+        category = await db.get(Category, category_id)
+        if not category or category.deleted_at:
+            raise AppError(404, "Category not found", "not_found")
+
+        content = await file.read()
+        if not content:
+            raise AppError(400, "Empty file", "empty_file")
+
+        mime = file.content_type or "application/octet-stream"
+        suffix = Path(file.filename or "upload").suffix.lower()
+        if suffix not in {".pdf", ".jpg", ".jpeg", ".png", ".webp"}:
+            raise AppError(400, "Invalid file extension", "invalid_extension")
+
+        settings = get_settings()
+        if mime not in settings.mime_allowlist:
+            raise AppError(400, f"File type not allowed: {mime}", "invalid_mime")
+        if len(content) > settings.max_upload_bytes:
+            raise AppError(413, "File exceeds maximum size", "file_too_large")
+
+        should_auto_thumb = kind == "image" and not category.thumb_url and mime.startswith("image/")
+
+        record = await store_upload_bytes(
+            db,
+            content=content,
+            mime_type=mime,
+            suffix=suffix,
+            uploaded_by=admin.id,
+            subdirectory="categories",
+        )
+        # store_upload_bytes flushes the session, which expires other loaded instances.
+        await db.refresh(category)
+        url = public_file_url(record.storage_key)
+        if kind == "image":
+            category.image_url = url
+            if should_auto_thumb:
+                try:
+                    thumb_bytes = make_thumbnail(content)
+                    thumb_record = await store_upload_bytes(
+                        db,
+                        content=thumb_bytes,
+                        mime_type="image/jpeg",
+                        suffix=".jpg",
+                        uploaded_by=admin.id,
+                        subdirectory="categories/thumbs",
+                    )
+                    await db.refresh(category)
+                    category.thumb_url = public_file_url(thumb_record.storage_key)
+                except AppError:
+                    # Keep the main image even if thumbnail generation fails.
+                    pass
+        else:
+            category.thumb_url = url
+
+        apply_update_audit(category, admin.id)
+        await db.flush()
+        await db.refresh(category)
         return await CategoryService._to_item(db, category)
 
     @staticmethod

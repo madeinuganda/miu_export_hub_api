@@ -5,7 +5,7 @@ from fastapi import APIRouter
 from app.schemas.ecommerce.auth import PlatformInfo, PlatformsResponse
 from app.models.shared.enums import EcommerceAccountType, ExportHubAccountType, Platform
 
-router = APIRouter(prefix="/platforms", tags=["platforms"])
+router = APIRouter(prefix="/platforms")
 
 
 @router.get("", response_model=PlatformsResponse)

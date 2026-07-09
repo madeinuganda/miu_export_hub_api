@@ -80,6 +80,18 @@ class ExportChecklistProgress(AuditMixin, Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ExportChecklistDocument(AuditMixin, Base):
+    """Uploaded supporting document for a single export checklist item."""
+
+    __tablename__ = "export_checklist_documents"
+    __table_args__ = (UniqueConstraint("org_id", "item_key"),)
+
+    org_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
+    item_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+
 class AccountVerificationToken(AuditMixin, Base):
     """Email activation / verification tokens for buyer (and future supplier) accounts."""
 

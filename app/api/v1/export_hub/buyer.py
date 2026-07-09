@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.shared.database import get_db
+from app.core.shared.exceptions import AppError
 from app.core.export_hub.deps import (
     get_buyer_org,
     get_current_buyer,
@@ -30,10 +31,14 @@ from app.models.export_hub.accounts import (
 from app.services.export_hub.buyer_onboarding_service import BuyerOnboardingService
 from app.services.export_hub.catalog_service import CatalogService
 from app.services.export_hub.order_service import OrderService
+from app.services.export_hub.payment_service import PaymentService
+from app.schemas.export_hub.payment import ExportHubPaymentInitResponse
+from app.services.export_hub.review_service import ExportHubReviewService
 from app.services.export_hub.rfq_service import CreateRfqRequest, RfqService
+from app.schemas.export_hub.review import ReviewCreateRequest
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
 
-router = APIRouter(prefix="/buyer", tags=["buyer"])
+router = APIRouter(prefix="/buyer")
 
 
 def _buyer_profile_payload(
@@ -242,24 +247,38 @@ async def update_buyer_sourcing_profile(
 @router.get("/browse")
 async def buyer_browse(
     category_id: UUID | None = None,
+    category: str | None = Query(None, description="Category slug filter"),
     q: str | None = None,
     db: AsyncSession = Depends(get_db),
     org: BuyerOrganization = Depends(get_buyer_org),
     _: BuyerAccount = Depends(require_buyer_password_changed),
 ):
-    return await CatalogService.buyer_browse(db, category_id, q, customer_type=org.industry)
+    return await CatalogService.buyer_browse(
+        db,
+        category_id=category_id,
+        category_slug=category,
+        q=q,
+        customer_type=org.industry,
+    )
 
 
 @router.get("/products")
 async def buyer_products(
     category_id: UUID | None = None,
+    category: str | None = Query(None, description="Category slug filter"),
     supplier_org_id: UUID | None = None,
     q: str | None = None,
     db: AsyncSession = Depends(get_db),
     org: BuyerOrganization = Depends(get_buyer_org),
     _: BuyerAccount = Depends(require_buyer_password_changed),
 ):
-    data = await CatalogService.buyer_browse(db, category_id, q, customer_type=org.industry)
+    data = await CatalogService.buyer_browse(
+        db,
+        category_id=category_id,
+        category_slug=category,
+        q=q,
+        customer_type=org.industry,
+    )
     if supplier_org_id:
         from app.models.export_hub.catalog import Product
         from app.models.shared.enums import ProductStatus
@@ -277,6 +296,27 @@ async def buyer_products(
 @router.get("/products/{product_id}")
 async def buyer_product(product_id: UUID, db: AsyncSession = Depends(get_db), _: BuyerAccount = Depends(require_buyer_password_changed)):
     return await CatalogService.buyer_product_detail(db, product_id)
+
+
+@router.get("/products/{product_id}/reviews")
+async def buyer_product_reviews(
+    product_id: UUID,
+    limit: int = Query(10, ge=1, le=50),
+    page: int = Query(1, ge=1),
+    db: AsyncSession = Depends(get_db),
+    _: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    return await ExportHubReviewService.list_product_reviews(db, product_id, limit=limit, offset=page)
+
+
+@router.post("/reviews")
+async def submit_product_review(
+    data: ReviewCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    org_id: UUID = Depends(require_onboarded_buyer_org_id),
+    account: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    return await ExportHubReviewService.submit_review(db, org_id, account, data)
 
 
 @router.post("/rfqs")
@@ -327,6 +367,23 @@ class MessageBodyRequest(BaseModel):
     body: str
 
 
+class OrderPaymentRequest(BaseModel):
+    payment_link_token: str | None = None
+
+
+@router.get("/rfqs/{public_id}/messages")
+async def rfq_messages(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    org_id: UUID = Depends(require_onboarded_buyer_org_id),
+    _: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    rfq = (await db.execute(select(Rfq).where(Rfq.public_id == public_id, Rfq.buyer_org_id == org_id))).scalar_one_or_none()
+    if not rfq:
+        raise AppError(404, "RFQ not found", "not_found")
+    return {"messages": await RfqService.list_messages_for_viewer(db, rfq.id, SenderRole.BUYER)}
+
+
 @router.post("/rfqs/{public_id}/messages")
 async def rfq_message(
     public_id: str,
@@ -336,8 +393,9 @@ async def rfq_message(
     account: BuyerAccount = Depends(require_buyer_password_changed),
 ):
     rfq = (await db.execute(select(Rfq).where(Rfq.public_id == public_id, Rfq.buyer_org_id == org_id))).scalar_one_or_none()
-    if rfq:
-        await RfqService.add_message(db, rfq.id, SenderRole.BUYER, data.body, account.id)
+    if not rfq:
+        raise AppError(404, "RFQ not found", "not_found")
+    await RfqService.add_message(db, rfq.id, SenderRole.BUYER, data.body, account.id)
     return {"ok": True}
 
 
@@ -351,6 +409,23 @@ async def buyer_order_detail(public_id: str, db: AsyncSession = Depends(get_db),
     return await OrderService.get_buyer_order_detail(db, org_id, public_id)
 
 
+@router.post("/orders/{public_id}/pay", response_model=ExportHubPaymentInitResponse)
+async def initiate_order_payment(
+    public_id: str,
+    data: OrderPaymentRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    org_id: UUID = Depends(require_onboarded_buyer_org_id),
+    account: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    return await PaymentService.initiate_order_payment(
+        db,
+        org_id,
+        account,
+        public_id,
+        data.payment_link_token if data else None,
+    )
+
+
 @router.get("/orders/{public_id}/invoice")
 async def buyer_invoice(public_id: str):
     return {"url": f"/uploads/invoices/{public_id}.pdf", "stub": True}
@@ -360,6 +435,36 @@ async def buyer_invoice(public_id: str):
 async def buyer_tracking(public_id: str, db: AsyncSession = Depends(get_db), org_id: UUID = Depends(require_onboarded_buyer_org_id), _: BuyerAccount = Depends(require_buyer_password_changed)):
     detail = await OrderService.get_buyer_order_detail(db, org_id, public_id)
     return {"trackingNumber": detail.get("trackingNumber"), "eta": detail.get("eta")}
+
+
+@router.get("/orders/{public_id}/messages")
+async def buyer_order_messages(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    org_id: UUID = Depends(require_onboarded_buyer_org_id),
+    _: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    order = (await db.execute(select(Order).where(Order.public_id == public_id, Order.buyer_org_id == org_id))).scalar_one_or_none()
+    if not order:
+        raise AppError(404, "Order not found", "not_found")
+    rfq_id = await RfqService.resolve_rfq_id_for_order(db, order)
+    return {"messages": await RfqService.list_messages_for_viewer(db, rfq_id, SenderRole.BUYER)}
+
+
+@router.post("/orders/{public_id}/messages")
+async def buyer_send_order_message(
+    public_id: str,
+    data: MessageBodyRequest,
+    db: AsyncSession = Depends(get_db),
+    org_id: UUID = Depends(require_onboarded_buyer_org_id),
+    account: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    order = (await db.execute(select(Order).where(Order.public_id == public_id, Order.buyer_org_id == org_id))).scalar_one_or_none()
+    if not order:
+        raise AppError(404, "Order not found", "not_found")
+    rfq_id = await RfqService.resolve_rfq_id_for_order(db, order)
+    await RfqService.add_message(db, rfq_id, SenderRole.BUYER, data.body, account.id)
+    return {"ok": True}
 
 
 @router.post("/orders/{public_id}/reorder")
@@ -410,74 +515,18 @@ async def unsave_supplier(supplier_org_id: UUID, db: AsyncSession = Depends(get_
     return {"ok": True}
 
 
-@router.get("/conversations/miu-account-manager")
-async def buyer_conversation(db: AsyncSession = Depends(get_db), org_id: UUID = Depends(require_onboarded_buyer_org_id), _: BuyerAccount = Depends(require_buyer_password_changed)):
-    from app.models.shared.enums import ConversationType
-    from app.models.export_hub.messaging import ConversationMessage, ConversationThread
-    thread = (
-        await db.execute(
-            select(ConversationThread).where(
-                ConversationThread.buyer_org_id == org_id,
-                ConversationThread.thread_type == ConversationType.BUYER_MIU,
-                ConversationThread.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if not thread:
-        return {"messages": []}
-    msgs = (
-        await db.execute(
-            select(ConversationMessage)
-            .where(ConversationMessage.thread_id == thread.id, ConversationMessage.deleted_at.is_(None))
-            .order_by(ConversationMessage.sent_at)
-        )
-    ).scalars().all()
-    return {
-        "messages": [
-            {"id": str(m.id), "from": m.sender_role.value, "body": m.body, "time": m.sent_at.isoformat(), "orderId": str(m.order_id) if m.order_id else None}
-            for m in msgs
-        ]
-    }
-
-
-@router.post("/conversations/miu-account-manager/messages")
-async def buyer_send_message(
-    data: MessageBodyRequest,
-    db: AsyncSession = Depends(get_db),
-    org_id: UUID = Depends(require_onboarded_buyer_org_id),
-    account: BuyerAccount = Depends(require_buyer_password_changed),
-):
-    from datetime import datetime, timezone
-    from app.models.shared.enums import ConversationType, SenderRole
-    from app.models.export_hub.messaging import ConversationMessage, ConversationThread
-    thread = (
-        await db.execute(select(ConversationThread).where(ConversationThread.buyer_org_id == org_id, ConversationThread.thread_type == ConversationType.BUYER_MIU))
-    ).scalar_one_or_none()
-    if not thread:
-        thread = ConversationThread(thread_type=ConversationType.BUYER_MIU, buyer_org_id=org_id, subject="MIU Account Manager")
-        apply_create_audit(thread, account.id)
-        db.add(thread)
-        await db.flush()
-    msg = ConversationMessage(thread_id=thread.id, sender_role=SenderRole.BUYER, body=data.body, sent_at=datetime.now(timezone.utc))
-    apply_create_audit(msg, account.id)
-    db.add(msg)
-    return {"ok": True}
-
-
 @router.get("/notifications/summary")
-async def buyer_notif_summary(db: AsyncSession = Depends(get_db), account: BuyerAccount = Depends(require_buyer_password_changed)):
-    unread = (
-        await db.execute(
-            select(BuyerNotification).where(
-                BuyerNotification.buyer_account_id == account.id,
-                BuyerNotification.read_at.is_(None),
-                BuyerNotification.deleted_at.is_(None),
-            )
-        )
-    ).scalars().all()
-    rfq_count = sum(1 for n in unread if n.type == "rfq")
-    msg_count = sum(1 for n in unread if n.type == "message")
-    return {"rfqs": rfq_count, "messages": msg_count}
+async def buyer_notif_summary(
+    db: AsyncSession = Depends(get_db),
+    org: BuyerOrganization = Depends(get_buyer_org),
+    _: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    from app.models.shared.enums import VerificationStatus
+    from app.services.export_hub.nav_badges_service import NavBadgesService
+
+    if org.onboarding_status != VerificationStatus.APPROVED:
+        return {"rfqs": 0, "messages": 0, "orders": 0, "total": 0}
+    return await NavBadgesService.buyer_badges(db, org.id)
 
 
 @router.get("/search")

@@ -37,8 +37,35 @@ class EcommerceShippingService:
 
     @staticmethod
     async def methods_for_shop(db: AsyncSession, shop_id: UUID) -> list[dict]:
-        _ = shop_id
+        from app.models.ecommerce.shipping_config import EcommerceShopShippingMethod
+
+        rows = (
+            await db.execute(
+                select(EcommerceShopShippingMethod)
+                .where(
+                    EcommerceShopShippingMethod.shop_id == shop_id,
+                    EcommerceShopShippingMethod.is_active.is_(True),
+                    EcommerceShopShippingMethod.deleted_at.is_(None),
+                )
+                .order_by(EcommerceShopShippingMethod.sort_order)
+            )
+        ).scalars().all()
+        if rows:
+            return [
+                {
+                    "id": row.code,
+                    "title": row.title,
+                    "duration": row.duration,
+                    "cost": float(row.cost),
+                    "currency": row.currency,
+                }
+                for row in rows
+            ]
         return EcommerceShippingService._default_methods()
+
+    @staticmethod
+    async def _methods_for_shop(db: AsyncSession, shop_id: UUID) -> list[dict]:
+        return await EcommerceShippingService.methods_for_shop(db, shop_id)
 
     @staticmethod
     async def check_shipping_type(db: AsyncSession, shop_id: UUID) -> dict:
@@ -52,7 +79,9 @@ class EcommerceShippingService:
         cart_group_id: UUID,
         method_id: str,
     ) -> dict:
-        methods = {m["id"]: m for m in EcommerceShippingService._default_methods()}
+        methods = {m["id"]: m for m in await EcommerceShippingService._methods_for_shop(db, cart_group_id)}
+        if not methods:
+            methods = {m["id"]: m for m in EcommerceShippingService._default_methods()}
         method = methods.get(method_id)
         if not method:
             raise AppError(404, "Shipping method not found", "shipping_method_not_found")

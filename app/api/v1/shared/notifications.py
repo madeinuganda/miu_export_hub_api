@@ -14,7 +14,7 @@ from app.schemas.shared.notifications import (
 )
 from app.services.shared.notifications import EmailDeliveryService, FcmService, SmsService
 
-router = APIRouter(prefix="/notifications", tags=["notifications"])
+router = APIRouter(prefix="/notifications")
 
 
 @router.get("/status", response_model=NotificationChannelStatus)

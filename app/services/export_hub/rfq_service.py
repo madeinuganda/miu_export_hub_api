@@ -10,11 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.shared.exceptions import AppError
 from app.models.export_hub.catalog import Product
-from app.models.shared.enums import ProductStatus, QuoteStatus, RfqStatus, SenderRole
+from app.models.shared.enums import MessageReviewStatus, ProductStatus, QuoteStatus, RfqStatus, SenderRole
 from app.models.export_hub.organizations import BuyerOrganization, SupplierOrganization
 from app.models.export_hub.rfqs import Rfq, RfqMessage, RfqQuote
 from app.utils.audit import apply_create_audit, apply_update_audit
-from app.utils.formatting import format_quantity, format_ugx
+from app.utils.formatting import format_quantity, format_relative_time, format_ugx
+
+OTHER_PARTY_ROLE = {
+    SenderRole.BUYER: SenderRole.SUPPLIER,
+    SenderRole.SUPPLIER: SenderRole.BUYER,
+}
 
 
 class CreateRfqRequest(BaseModel):
@@ -122,7 +127,7 @@ class RfqService:
             await db.execute(select(Rfq).where(Rfq.buyer_org_id == buyer_org_id, Rfq.deleted_at.is_(None)).order_by(Rfq.sent_at.desc()))
         ).scalars().all()
         items = [await RfqService._serialize_buyer_listing(db, r) for r in rfqs]
-        awaiting = sum(1 for i in items if i["status"] == "awaiting")
+        awaiting = sum(1 for i in items if i["status"] == "responded")
         return {"items": items, "summary": {"total": len(items), "awaitingYourResponse": awaiting}}
 
     @staticmethod
@@ -163,7 +168,7 @@ class RfqService:
                     "product": product.name if product else "",
                     "route": f"via MIU Admin · {buyer.country if buyer else 'International'}",
                     "quantity": format_quantity(rfq.quantity, rfq.unit),
-                    "time": "recent",
+                    "time": format_relative_time(rfq.sent_at),
                     "status": st,
                     "sampleRequested": rfq.sample_requested,
                 }
@@ -196,7 +201,131 @@ class RfqService:
         return {"status": "quote_sent"}
 
     @staticmethod
-    async def add_message(db: AsyncSession, rfq_id: UUID, role: SenderRole, body: str, user_id: UUID | None) -> None:
-        msg = RfqMessage(rfq_id=rfq_id, sender_role=role, body=body, sent_at=datetime.now(timezone.utc))
+    async def add_message(
+        db: AsyncSession,
+        rfq_id: UUID,
+        role: SenderRole,
+        body: str,
+        user_id: UUID | None,
+        *,
+        admin_note: str | None = None,
+    ) -> RfqMessage:
+        """Create a message on the deal thread. Buyer/supplier messages start
+        PENDING (invisible to the other party until an admin routes them);
+        admin/system messages are considered already reviewed."""
+        review_status = (
+            MessageReviewStatus.PENDING if role in (SenderRole.BUYER, SenderRole.SUPPLIER) else MessageReviewStatus.ROUTED
+        )
+        msg = RfqMessage(
+            rfq_id=rfq_id,
+            sender_role=role,
+            body=body,
+            sent_at=datetime.now(timezone.utc),
+            review_status=review_status,
+            admin_note=admin_note if review_status == MessageReviewStatus.ROUTED else None,
+        )
         apply_create_audit(msg, user_id)
         db.add(msg)
+        await db.flush()
+        return msg
+
+    @staticmethod
+    def _serialize_message(m: RfqMessage, *, admin_view: bool) -> dict:
+        item = {
+            "id": str(m.id),
+            "senderRole": m.sender_role.value,
+            "body": m.body,
+            "sentAt": m.sent_at.isoformat(),
+            "reviewStatus": m.review_status.value,
+        }
+        if admin_view:
+            item["adminNote"] = m.admin_note
+            item["revertNote"] = m.revert_note
+            item["reviewedAt"] = m.reviewed_at.isoformat() if m.reviewed_at else None
+        else:
+            if m.admin_note:
+                item["adminNote"] = m.admin_note
+            if m.review_status == MessageReviewStatus.REVERTED:
+                item["revertNote"] = m.revert_note
+        return item
+
+    @staticmethod
+    async def _rfq_messages(db: AsyncSession, rfq_id: UUID) -> list[RfqMessage]:
+        return (
+            await db.execute(
+                select(RfqMessage)
+                .where(RfqMessage.rfq_id == rfq_id, RfqMessage.deleted_at.is_(None))
+                .order_by(RfqMessage.sent_at)
+            )
+        ).scalars().all()
+
+    @staticmethod
+    async def list_messages_for_viewer(db: AsyncSession, rfq_id: UUID, viewer_role: SenderRole) -> list[dict]:
+        """Messages visible to a buyer or supplier viewer: their own messages
+        (any review status, so they can see 'pending review' / 'reverted'
+        badges on what they sent), plus routed admin/system messages, plus
+        the other party's messages only once routed by an admin."""
+        other_role = OTHER_PARTY_ROLE[viewer_role]
+        rows = await RfqService._rfq_messages(db, rfq_id)
+        visible = []
+        for m in rows:
+            if m.sender_role == viewer_role:
+                visible.append(m)
+            elif m.review_status == MessageReviewStatus.ROUTED:
+                visible.append(m)
+        return [RfqService._serialize_message(m, admin_view=False) for m in visible]
+
+    @staticmethod
+    async def list_messages_for_admin(db: AsyncSession, rfq_id: UUID) -> list[dict]:
+        rows = await RfqService._rfq_messages(db, rfq_id)
+        return [RfqService._serialize_message(m, admin_view=True) for m in rows]
+
+    @staticmethod
+    async def pending_message_count(db: AsyncSession, rfq_id: UUID) -> int:
+        return (
+            await db.execute(
+                select(func.count()).select_from(RfqMessage).where(
+                    RfqMessage.rfq_id == rfq_id,
+                    RfqMessage.review_status == MessageReviewStatus.PENDING,
+                    RfqMessage.deleted_at.is_(None),
+                )
+            )
+        ).scalar() or 0
+
+    @staticmethod
+    async def route_message(
+        db: AsyncSession, admin_id: UUID, rfq_id: UUID, message_id: UUID, note: str | None
+    ) -> RfqMessage:
+        msg = await db.get(RfqMessage, message_id)
+        if not msg or msg.rfq_id != rfq_id or msg.deleted_at:
+            raise AppError(404, "Message not found", "not_found")
+        if msg.review_status != MessageReviewStatus.PENDING:
+            raise AppError(400, "Message has already been reviewed", "invalid_status")
+        msg.review_status = MessageReviewStatus.ROUTED
+        msg.reviewed_at = datetime.now(timezone.utc)
+        msg.reviewed_by = admin_id
+        msg.admin_note = note
+        apply_update_audit(msg, admin_id)
+        return msg
+
+    @staticmethod
+    async def revert_message(
+        db: AsyncSession, admin_id: UUID, rfq_id: UUID, message_id: UUID, remarks: str
+    ) -> RfqMessage:
+        msg = await db.get(RfqMessage, message_id)
+        if not msg or msg.rfq_id != rfq_id or msg.deleted_at:
+            raise AppError(404, "Message not found", "not_found")
+        if msg.review_status != MessageReviewStatus.PENDING:
+            raise AppError(400, "Message has already been reviewed", "invalid_status")
+        msg.review_status = MessageReviewStatus.REVERTED
+        msg.reviewed_at = datetime.now(timezone.utc)
+        msg.reviewed_by = admin_id
+        msg.revert_note = remarks
+        apply_update_audit(msg, admin_id)
+        return msg
+
+    @staticmethod
+    async def resolve_rfq_id_for_order(db: AsyncSession, order) -> UUID:
+        if not order.rfq_id:
+            raise AppError(400, "Order has no linked RFQ thread", "no_thread")
+        return order.rfq_id

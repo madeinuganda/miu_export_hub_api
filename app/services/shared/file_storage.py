@@ -35,6 +35,31 @@ async def store_upload_file(
     if suffix not in {".pdf", ".jpg", ".jpeg", ".png", ".webp"}:
         raise AppError(400, "Invalid file extension", "invalid_extension")
 
+    return await store_upload_bytes(
+        db,
+        content=content,
+        mime_type=mime,
+        suffix=suffix,
+        uploaded_by=uploaded_by,
+        subdirectory=subdirectory,
+    )
+
+
+async def store_upload_bytes(
+    db: AsyncSession,
+    *,
+    content: bytes,
+    mime_type: str,
+    suffix: str,
+    uploaded_by: UUID,
+    subdirectory: str,
+) -> FileRecord:
+    settings = get_settings()
+    if not content:
+        raise AppError(400, "Empty file", "empty_file")
+    if len(content) > settings.max_upload_bytes:
+        raise AppError(413, "File exceeds maximum size", "file_too_large")
+
     storage_key = f"{subdirectory.strip('/')}/{uuid4().hex}{suffix}"
     dest = Path(settings.storage_path) / storage_key
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -42,7 +67,7 @@ async def store_upload_file(
 
     record = FileRecord(
         storage_key=storage_key,
-        mime_type=mime,
+        mime_type=mime_type,
         size_bytes=len(content),
         uploaded_by=uploaded_by,
     )
@@ -50,3 +75,8 @@ async def store_upload_file(
     db.add(record)
     await db.flush()
     return record
+
+
+def public_file_url(storage_key: str) -> str:
+    key = storage_key.lstrip("/")
+    return f"/uploads/{key}"

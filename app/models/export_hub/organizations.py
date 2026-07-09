@@ -4,7 +4,7 @@ from datetime import date, datetime  # noqa: F401 — datetime used by onboardin
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum, SmallInteger, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -64,6 +64,13 @@ class SupplierOrganization(AuditMixin, Base):
     )
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     storefront_published: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    banner_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    banner_style: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    logo_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    established_year: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    team_size: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    export_markets: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
 
 class SupplierOrganizationMember(AuditMixin, Base):
@@ -95,6 +102,7 @@ class SupplierCertification(AuditMixin, Base):
     )
     expiry_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     document_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    sort_order: Mapped[int] = mapped_column(default=0, nullable=False)
 
 
 class SupplierGalleryPhoto(AuditMixin, Base):

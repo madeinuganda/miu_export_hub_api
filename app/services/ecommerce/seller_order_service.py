@@ -199,4 +199,19 @@ class EcommerceSellerOrderService:
 
         order.order_status = status
         await db.flush()
+        if order.customer_id:
+            from app.models.ecommerce.accounts import CustomerAccount
+            from app.services.ecommerce.notification_service import EcommerceNotificationService
+
+            customer = await db.get(CustomerAccount, order.customer_id)
+            if customer:
+                await EcommerceNotificationService.notify_customer(
+                    db,
+                    customer_id=customer.id,
+                    title=f"Order {order.public_id} updated",
+                    body=f"Your order status is now: {status.value.replace('_', ' ')}",
+                    notification_type="order_status",
+                    reference_id=order.id,
+                    email=customer.email,
+                )
         return {"message": "Order status updated", "order_status": status.value}

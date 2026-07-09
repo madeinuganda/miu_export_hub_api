@@ -9,8 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.shared.database import get_db
 from app.schemas.ecommerce.catalog import GuestIdResponse, ProductFilterQuery, ProductSearchQuery
 from app.services.ecommerce.catalog_service import EcommerceCatalogService
+from app.services.ecommerce.shop_service import EcommerceShopService
 
-router = APIRouter(tags=["E-Commerce · Catalog"])
+router = APIRouter()
 
 
 @router.get("/get-guest-id", response_model=GuestIdResponse)
@@ -140,3 +141,21 @@ async def brand_products(
 @router.get("/banners")
 async def list_banners(db: AsyncSession = Depends(get_db)):
     return await EcommerceCatalogService.list_banners(db)
+
+
+@router.get("/shops/{slug}")
+async def shop_detail(slug: str, db: AsyncSession = Depends(get_db)):
+    return await EcommerceShopService.get_shop_by_slug(db, slug)
+
+
+@router.get("/shops/{slug}/products")
+async def shop_products(
+    slug: str,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(1, ge=1),
+    search: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    return await EcommerceShopService.list_shop_products(
+        db, slug, limit=limit, offset=offset, search=search
+    )

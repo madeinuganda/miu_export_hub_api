@@ -19,7 +19,7 @@ from app.schemas.export_hub.buyer_onboarding import (
 from app.services.export_hub.buyer_onboarding_service import BuyerOnboardingService
 from app.utils.audit import apply_create_audit
 
-router = APIRouter(prefix="/buyer", tags=["buyer"])
+router = APIRouter(prefix="/buyer")
 
 
 @router.get("/onboarding", response_model=BuyerOnboardingDraftResponse)

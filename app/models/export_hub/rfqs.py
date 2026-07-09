@@ -10,7 +10,8 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.shared.base import AuditMixin
-from app.models.shared.enums import QuoteStatus, RfqStatus, SenderRole
+from app.models.shared.db_types import str_enum
+from app.models.shared.enums import MessageReviewStatus, QuoteStatus, RfqStatus, SenderRole
 from app.core.shared.database import Base
 
 
@@ -50,9 +51,30 @@ class RfqQuote(AuditMixin, Base):
 
 
 class RfqMessage(AuditMixin, Base):
+    """The single canonical thread for a deal: covers RFQ negotiation and
+    continues to serve as the Order's message thread once the RFQ converts
+    (Order.rfq_id points back to the same row this is scoped by).
+
+    Buyer/supplier messages are relayed through MIU Admin: they are created
+    with review_status=PENDING and stay invisible to the other party until an
+    admin routes (delivers, optionally with an admin_note) or reverts (bounces
+    back to the sender with revert_note) them. Admin- and system-authored
+    messages are always created already ROUTED.
+    """
+
     __tablename__ = "rfq_messages"
 
     rfq_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
     sender_role: Mapped[SenderRole] = mapped_column(Enum(SenderRole, name="rfq_sender_role"), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    review_status: Mapped[MessageReviewStatus] = mapped_column(
+        str_enum(MessageReviewStatus, name="message_review_status"),
+        default=MessageReviewStatus.ROUTED,
+        server_default=MessageReviewStatus.ROUTED.value,
+        nullable=False,
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_by: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    admin_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    revert_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

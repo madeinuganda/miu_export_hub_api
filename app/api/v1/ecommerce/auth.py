@@ -8,14 +8,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.ecommerce.deps import (
     get_current_customer,
     get_current_ecommerce_admin,
+    get_current_seller,
     require_customer_password_changed,
     require_ecommerce_admin_password_changed,
     require_seller_password_changed,
 )
 from app.core.shared.database import get_db
 from app.core.shared.deps import get_refresh_bearer_token
-from app.models.ecommerce.accounts import CustomerAccount, EcommerceAdminAccount, SellerAccount
-from app.schemas.shared.auth_common import LoginRequest
+from app.models.ecommerce.accounts import CustomerAccount, CustomerSession, EcommerceAdminAccount, EcommerceAdminSession, SellerAccount, SellerSession
+from app.schemas.export_hub.auth import (
+    ChangePasswordRequest,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
+    LoginRequest,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
+)
 from app.schemas.ecommerce.auth import (
     CustomerAuthResponse,
     CustomerLoginRequest,
@@ -28,10 +36,11 @@ from app.models.shared.enums import EcommerceAccountType, Platform
 from app.schemas.ecommerce.seller import SellerAuthResponse, SellerMeResponse
 from app.services.ecommerce.admin_auth_service import EcommerceAdminAuthService
 from app.services.ecommerce.customer_auth_service import EcommerceCustomerAuthService
+from app.services.ecommerce.password_reset_service import EcommercePasswordResetService
 from app.services.ecommerce.seller_auth_service import EcommerceSellerAuthService
 from app.services.shared.rbac_service import RbacService
 
-router = APIRouter(prefix="/auth", tags=["E-Commerce · Auth"])
+router = APIRouter(prefix="/auth")
 
 
 def _client_meta(request: Request) -> tuple[str | None, str | None]:
@@ -39,8 +48,15 @@ def _client_meta(request: Request) -> tuple[str | None, str | None]:
 
 
 @router.post("/customer/register", response_model=CustomerAuthResponse)
-async def customer_register(data: CustomerRegisterRequest, db: AsyncSession = Depends(get_db)):
+async def customer_register(
+    data: CustomerRegisterRequest,
+    x_guest_id: UUID | None = Header(None, alias="X-Guest-Id"),
+    db: AsyncSession = Depends(get_db),
+):
     """Register a retail or shop customer account (separate from Export Hub buyers)."""
+    guest_id = _resolve_guest_id(data.guest_id, x_guest_id)
+    if guest_id and not data.guest_id:
+        data = data.model_copy(update={"guest_id": guest_id})
     result = await EcommerceCustomerAuthService.register(db, data)
     await db.commit()
     return result
@@ -174,3 +190,105 @@ async def seller_logout(
     await EcommerceSellerAuthService.logout(db, refresh_token)
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/customer/change-password")
+async def customer_change_password(
+    data: ChangePasswordRequest,
+    account: CustomerAccount = Depends(get_current_customer),
+    db: AsyncSession = Depends(get_db),
+):
+    await EcommercePasswordResetService.change_password(
+        db, account, data.current_password, data.new_password, CustomerSession, "customer_account_id"
+    )
+    await db.commit()
+    return {"ok": True, "mustChangePassword": False}
+
+
+@router.post("/customer/forgot-password", response_model=ForgotPasswordResponse)
+async def customer_forgot_password(data: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    message = await EcommercePasswordResetService.request_reset(
+        db, account_type="ec_customer", email=str(data.email)
+    )
+    await db.commit()
+    return ForgotPasswordResponse(message=message)
+
+
+@router.post("/customer/reset-password", response_model=ResetPasswordResponse)
+async def customer_reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    await EcommercePasswordResetService.reset_password(
+        db, account_type="ec_customer", raw_token=data.token, new_password=data.new_password
+    )
+    await db.commit()
+    return ResetPasswordResponse()
+
+
+@router.post("/seller/change-password")
+async def seller_change_password(
+    data: ChangePasswordRequest,
+    account: SellerAccount = Depends(get_current_seller),
+    db: AsyncSession = Depends(get_db),
+):
+    await EcommercePasswordResetService.change_password(
+        db, account, data.current_password, data.new_password, SellerSession, "seller_account_id"
+    )
+    await db.commit()
+    return {"ok": True, "mustChangePassword": False}
+
+
+@router.post("/seller/forgot-password", response_model=ForgotPasswordResponse)
+async def seller_forgot_password(data: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    message = await EcommercePasswordResetService.request_reset(
+        db, account_type="ec_seller", email=str(data.email)
+    )
+    await db.commit()
+    return ForgotPasswordResponse(message=message)
+
+
+@router.post("/seller/reset-password", response_model=ResetPasswordResponse)
+async def seller_reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    await EcommercePasswordResetService.reset_password(
+        db, account_type="ec_seller", raw_token=data.token, new_password=data.new_password
+    )
+    await db.commit()
+    return ResetPasswordResponse()
+
+
+@router.post("/admin/change-password")
+async def ecommerce_admin_change_password(
+    data: ChangePasswordRequest,
+    account: EcommerceAdminAccount = Depends(get_current_ecommerce_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    await EcommercePasswordResetService.change_password(
+        db,
+        account,
+        data.current_password,
+        data.new_password,
+        EcommerceAdminSession,
+        "ecommerce_admin_account_id",
+    )
+    await db.commit()
+    return {"ok": True, "mustChangePassword": False}
+
+
+@router.post("/admin/forgot-password", response_model=ForgotPasswordResponse)
+async def ecommerce_admin_forgot_password(
+    data: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)
+):
+    message = await EcommercePasswordResetService.request_reset(
+        db, account_type="ec_admin", email=str(data.email)
+    )
+    await db.commit()
+    return ForgotPasswordResponse(message=message)
+
+
+@router.post("/admin/reset-password", response_model=ResetPasswordResponse)
+async def ecommerce_admin_reset_password(
+    data: ResetPasswordRequest, db: AsyncSession = Depends(get_db)
+):
+    await EcommercePasswordResetService.reset_password(
+        db, account_type="ec_admin", raw_token=data.token, new_password=data.new_password
+    )
+    await db.commit()
+    return ResetPasswordResponse()

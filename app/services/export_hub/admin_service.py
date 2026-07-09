@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.shared.exceptions import AppError
@@ -15,7 +15,6 @@ from app.models.export_hub.catalog import Category, Product
 from app.models.shared.enums import (
     DocumentStatus,
     EscrowStatus,
-    MilestoneState,
     OrderStatus,
     PaymentMilestoneStatus,
     QuoteStatus,
@@ -23,11 +22,19 @@ from app.models.shared.enums import (
     SenderRole,
     VerificationStatus,
 )
-from app.models.export_hub.misc import AdminActionLog, BuyerRegistrationDraft, FileRecord, RegistrationDocument, SupplierRegistrationDraft
+from app.models.export_hub.misc import AdminActionLog, BuyerRegistrationDraft, BuyerSavedSupplier, FileRecord, RegistrationDocument, SupplierRegistrationDraft
 from app.models.export_hub.orders import Order, OrderActivity, OrderMilestone, OrderTracking
 from app.models.export_hub.organizations import BuyerOrganization, SupplierOrganization
 from app.models.export_hub.payments import PaymentEscrow, PaymentMilestone
-from app.models.export_hub.rfqs import Rfq, RfqMessage, RfqQuote
+from app.models.export_hub.rfqs import Rfq, RfqQuote
+from app.services.export_hub.order_service import (
+    ADMIN_PIPELINE,
+    PIPELINE_BY_STAGE,
+    PIPELINE_STAGE_IDS,
+    OrderService,
+)
+from app.services.export_hub.rfq_service import RfqService
+from app.services.export_hub.buyer_account_cleanup import hard_purge_buyer_account
 from app.schemas.export_hub.admin import (
     AdminDealListItem,
     AdminDealListResponse,
@@ -53,19 +60,8 @@ from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
 from app.utils.formatting import format_quantity, format_ugx
 from app.utils.pagination import paginate
 
-ADMIN_PIPELINE: list[tuple[str, str, OrderStatus]] = [
-    ("confirmed", "Confirmed", OrderStatus.ORDER_PLACED),
-    ("payment_secured", "Payment Secured", OrderStatus.PAYMENT_SECURED),
-    ("in_production", "In Production", OrderStatus.IN_PRODUCTION),
-    ("ready_to_dispatch", "Ready to Dispatch", OrderStatus.QUALITY_CHECK),
-    ("shipped", "Shipped", OrderStatus.SHIPPED),
-    ("delivered", "Delivered", OrderStatus.DELIVERED),
-    ("fulfilled", "Fulfilled", OrderStatus.FULFILLED),
-]
-
-PIPELINE_STAGE_IDS = [s[0] for s in ADMIN_PIPELINE]
-PIPELINE_BY_STAGE = {s[0]: (i, label, status) for i, (s, label, status) in enumerate(ADMIN_PIPELINE)}
-ORDER_STATUS_TO_STAGE = {status: stage for stage, _, status in ADMIN_PIPELINE}
+# ADMIN_PIPELINE and friends now live in order_service.py so admin, supplier,
+# and buyer order views all share the exact same lifecycle/milestone vocabulary.
 
 # key, label, document_type aliases (supplier onboarding + legacy), required for verification
 VERIFICATION_DOC_SPECS: list[tuple[str, str, list[str], bool]] = [
@@ -254,6 +250,7 @@ class AdminService:
                     response_hours.append(hours)
 
             action = "review_and_route" if admin_status == "new" else "view"
+            pending_messages = await RfqService.pending_message_count(db, rfq.id)
             all_items.append(
                 AdminRfqListItem(
                     id=rfq.id,
@@ -269,6 +266,7 @@ class AdminService:
                     status=admin_status,
                     assigned_admin_name=AdminService._admin_short_name(admin),
                     action=action,
+                    pending_message_count=pending_messages,
                 )
             )
 
@@ -283,6 +281,7 @@ class AdminService:
             if (rfq.sent_at or rfq.created_at) >= week_ago and rfq.status not in (RfqStatus.CANCELLED, RfqStatus.EXPIRED)
         )
         avg_hours = round(sum(response_hours) / len(response_hours), 1) if response_hours else None
+        needs_review = sum(1 for i in all_items if i.pending_message_count > 0)
         paged = paginate(items, page, page_size)
         return AdminRfqListResponse(
             summary=AdminRfqListSummary(
@@ -290,6 +289,7 @@ class AdminService:
                 total=len(all_items),
                 avg_response_hours=avg_hours,
                 active_this_week=active_week,
+                needs_review_count=needs_review,
             ),
             items=paged.items,
             page=paged.page,
@@ -332,11 +332,8 @@ class AdminService:
         quotes = (
             await db.execute(select(RfqQuote).where(RfqQuote.rfq_id == rfq.id, RfqQuote.deleted_at.is_(None)))
         ).scalars().all()
-        messages = (
-            await db.execute(
-                select(RfqMessage).where(RfqMessage.rfq_id == rfq.id, RfqMessage.deleted_at.is_(None)).order_by(RfqMessage.sent_at)
-            )
-        ).scalars().all()
+        messages = await RfqService.list_messages_for_admin(db, rfq.id)
+        pending_message_count = sum(1 for m in messages if m["reviewStatus"] == "pending")
         assign_logs = (
             await db.execute(
                 select(AdminActionLog)
@@ -365,6 +362,7 @@ class AdminService:
         return {
             "id": str(rfq.id),
             "public_id": rfq.public_id,
+            "rfq_public_id": rfq.public_id,
             "status": admin_status,
             "buyer": {
                 "name": buyer_name,
@@ -391,9 +389,8 @@ class AdminService:
                 }
                 for q in quotes
             ],
-            "messages": [
-                {"sender_role": m.sender_role.value, "body": m.body, "sent_at": m.sent_at.isoformat()} for m in messages
-            ],
+            "messages": messages,
+            "pending_message_count": pending_message_count,
             "assignment_history": history,
             "assigned_admin_name": AdminService._admin_short_name(admin),
             "updated_at": rfq.updated_at.isoformat(),
@@ -491,6 +488,7 @@ class AdminService:
             value = int((quote.unit_price * rfq.quantity) if quote else (product.price_amount or 0) * rfq.quantity if product else 0)
             admin = await AdminService._load_admin(db, rfq.updated_by)
             last_at = quote.sent_at if quote and quote.sent_at else rfq.updated_at
+            pending_messages = await RfqService.pending_message_count(db, rfq.id)
 
             items.append(
                 AdminDealListItem(
@@ -506,13 +504,16 @@ class AdminService:
                     status=deal_status,
                     last_activity_at=last_at,
                     assigned_admin_name=AdminService._admin_short_name(admin),
+                    pending_message_count=pending_messages,
                 )
             )
 
         active = sum(1 for i in items if i.status in ("active", "quote_sent"))
+        needs_review = sum(1 for i in items if i.pending_message_count > 0)
         paged = paginate(items, page, page_size)
         return AdminDealListResponse(
             active_deals_count=active,
+            needs_review_count=needs_review,
             items=paged.items,
             page=paged.page,
             page_size=paged.page_size,
@@ -573,16 +574,7 @@ class AdminService:
         apply_update_audit(rfq, admin.id)
 
         if data.message:
-            db.add(
-                RfqMessage(
-                    rfq_id=rfq.id,
-                    sender_role=SenderRole.ADMIN,
-                    body=data.message,
-                    sent_at=datetime.now(timezone.utc),
-                    created_by=admin.id,
-                    updated_by=admin.id,
-                )
-            )
+            await RfqService.add_message(db, rfq.id, SenderRole.ADMIN, data.message, admin.id)
 
         log = AdminActionLog(
             admin_account_id=admin.id,
@@ -596,16 +588,50 @@ class AdminService:
         return {"ok": True, "public_id": rfq.public_id, "deal_id": AdminService._deal_public_id(rfq)}
 
     @staticmethod
+    async def _resolve_rfq_by_public_id(db: AsyncSession, public_id: str) -> Rfq:
+        """Accepts either an RFQ public id (RFQ-2026-001) or a Deal public id
+        (DEAL-2026-001, derived from the same RFQ) and resolves the Rfq row."""
+        suffix = public_id.replace("DEAL-", "", 1) if public_id.startswith("DEAL-") else public_id
+        rfq_public = public_id if public_id.startswith("RFQ-") else f"RFQ-{suffix}"
+        rfq = (
+            await db.execute(select(Rfq).where(Rfq.public_id == rfq_public, Rfq.deleted_at.is_(None)))
+        ).scalar_one_or_none()
+        if not rfq:
+            raise AppError(404, "RFQ not found", "not_found")
+        return rfq
+
+    @staticmethod
+    async def send_relay_message(db: AsyncSession, admin: AdminAccount, public_id: str, body: str) -> dict:
+        """Admin posts a message directly into the thread; it's visible to
+        both parties immediately (no review needed since admin authored it)."""
+        rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
+        msg = await RfqService.add_message(db, rfq.id, SenderRole.ADMIN, body, admin.id)
+        return RfqService._serialize_message(msg, admin_view=True)
+
+    @staticmethod
+    async def route_message(db: AsyncSession, admin: AdminAccount, public_id: str, message_id: UUID, note: str | None) -> dict:
+        rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
+        msg = await RfqService.route_message(db, admin.id, rfq.id, message_id, note)
+        return RfqService._serialize_message(msg, admin_view=True)
+
+    @staticmethod
+    async def revert_message(db: AsyncSession, admin: AdminAccount, public_id: str, message_id: UUID, remarks: str) -> dict:
+        rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
+        msg = await RfqService.revert_message(db, admin.id, rfq.id, message_id, remarks)
+        return RfqService._serialize_message(msg, admin_view=True)
+
+    @staticmethod
+    async def list_thread_messages(db: AsyncSession, public_id: str) -> dict:
+        rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
+        return {"rfqPublicId": rfq.public_id, "messages": await RfqService.list_messages_for_admin(db, rfq.id)}
+
+    @staticmethod
     def pipeline_stages() -> list[dict]:
-        return [
-            {"id": stage_id, "label": label, "index": i}
-            for i, (stage_id, label, _) in enumerate(ADMIN_PIPELINE)
-        ]
+        return OrderService.pipeline_stages()
 
     @staticmethod
     def _order_pipeline_index(order: Order) -> int:
-        stage = ORDER_STATUS_TO_STAGE.get(order.status, "confirmed")
-        return PIPELINE_BY_STAGE[stage][0]
+        return OrderService.order_pipeline_index(order)
 
     @staticmethod
     async def _sync_admin_pipeline_milestones(
@@ -614,51 +640,7 @@ class AdminService:
         target_index: int,
         admin_id: UUID,
     ) -> list[OrderMilestone]:
-        existing = (
-            await db.execute(
-                select(OrderMilestone).where(
-                    OrderMilestone.order_id == order.id,
-                    OrderMilestone.deleted_at.is_(None),
-                )
-            )
-        ).scalars().all()
-        by_key = {m.step_key: m for m in existing}
-        synced: list[OrderMilestone] = []
-
-        for i, (stage_id, label, _) in enumerate(ADMIN_PIPELINE):
-            if i < target_index:
-                state = MilestoneState.COMPLETE
-            elif i == target_index:
-                state = MilestoneState.CURRENT
-            else:
-                state = MilestoneState.UPCOMING
-
-            milestone = by_key.get(stage_id)
-            if milestone:
-                milestone.label = label
-                milestone.state = state
-                milestone.sort_order = i
-                apply_update_audit(milestone, admin_id)
-                synced.append(milestone)
-            else:
-                milestone = OrderMilestone(
-                    order_id=order.id,
-                    step_key=stage_id,
-                    label=label,
-                    state=state,
-                    sort_order=i,
-                    created_by=admin_id,
-                    updated_by=admin_id,
-                )
-                db.add(milestone)
-                synced.append(milestone)
-
-        for milestone in existing:
-            if milestone.step_key not in PIPELINE_STAGE_IDS:
-                soft_delete(milestone, admin_id)
-
-        await db.flush()
-        return sorted(synced, key=lambda m: m.sort_order)
+        return await OrderService.sync_pipeline_milestones(db, order, target_index, admin_id)
 
     @staticmethod
     def _pipeline_steps_for_index(pipeline_index: int) -> list[dict]:
@@ -1947,6 +1929,13 @@ class AdminService:
         if not org or org.deleted_at:
             raise AppError(404, "Buyer not found", "not_found")
 
+        members = (
+            await db.execute(
+                select(BuyerOrganizationMember).where(BuyerOrganizationMember.org_id == org_id)
+            )
+        ).scalars().all()
+        account_ids = [member.buyer_account_id for member in members]
+
         # Do not allow hard delete while there are RFQs or orders referencing this org.
         rfq_count = (
             await db.execute(
@@ -1959,16 +1948,29 @@ class AdminService:
             raise AppError(409, "Cannot hard-delete buyer with RFQs", "has_rfqs")
 
         if hard:
+            await db.execute(delete(BuyerSavedSupplier).where(BuyerSavedSupplier.buyer_org_id == org_id))
+            await db.execute(delete(RegistrationDocument).where(RegistrationDocument.org_id == org_id))
+            for member in members:
+                await db.delete(member)
             await db.delete(org)
+            for account_id in account_ids:
+                await hard_purge_buyer_account(db, account_id)
         else:
             soft_delete(org, admin.id)
+            for member in members:
+                if not member.deleted_at:
+                    soft_delete(member, admin.id)
+            for account_id in account_ids:
+                account = await db.get(BuyerAccount, account_id)
+                if account and not account.deleted_at:
+                    soft_delete(account, admin.id)
 
         log = AdminActionLog(
             admin_account_id=admin.id,
             action="delete_buyer_org_hard" if hard else "delete_buyer_org_soft",
             entity_type="buyer_org",
             entity_id=org.id,
-            metadata_={"hard": hard},
+            metadata_={"hard": hard, "account_ids": [str(account_id) for account_id in account_ids]},
         )
         apply_create_audit(log, admin.id)
         db.add(log)

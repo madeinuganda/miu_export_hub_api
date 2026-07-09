@@ -27,8 +27,8 @@ class Settings(BaseSettings):
     storage_path: str = "./uploads"
     # cors_origins: str = "http://localhost:5173"
     cors_origins: str = "*"
-    # frontend_base_url: str = "http://localhost:5173"
-    frontend_base_url: str = "http://89.117.56.56/export-hub"
+    frontend_base_url: str = "https://exporthub.miu.ug"
+    # frontend_base_url: str = "http://89.117.56.56/export-hub"
     environment: str = "production"
     password_reset_ttl_hours: int = 1
     max_upload_bytes: int = 10 * 1024 * 1024
@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     ecommerce_frontend_base_url: str = "http://localhost:3000"
     ecommerce_default_shipping_cost: float = 5000.0
     ecommerce_tax_rate_percent: float = 0.0
+    ecommerce_wallet_enabled: bool = True
+    ecommerce_wallet_min_add_fund: float = 1000.0
+    ecommerce_wallet_max_add_fund: float = 5000000.0
 
     # Pesapal API 3.0 (Laravel gateway key: flutterwave)
     pesapal_consumer_key: str = ""

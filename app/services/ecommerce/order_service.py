@@ -15,6 +15,7 @@ from app.core.shared.exceptions import AppError
 from app.models.ecommerce.accounts import CustomerAccount
 from app.models.ecommerce.cart import EcommerceCartItem
 from app.models.ecommerce.catalog import EcommerceProduct
+from app.models.ecommerce.promotions import EcommerceCoupon
 from app.models.ecommerce.orders import EcommerceOrder, EcommerceOrderItem, EcommercePaymentRequest
 from app.models.shared.enums import (
     EcommerceOrderStatus,
@@ -25,7 +26,9 @@ from app.models.shared.enums import (
 )
 from app.services.ecommerce.cart_service import EcommerceCartService
 from app.services.ecommerce.address_service import EcommerceAddressService
+from app.services.ecommerce.coupon_service import EcommerceCouponService
 from app.services.ecommerce.shipping_service import EcommerceShippingService
+from app.services.ecommerce.wallet_service import EcommerceWalletService
 
 
 class EcommerceOrderService:
@@ -91,6 +94,7 @@ class EcommerceOrderService:
     async def _totals_for_group(
         items: list[EcommerceCartItem],
         shipping_cost: Decimal,
+        coupon_discount: Decimal = Decimal("0"),
     ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         settings = get_settings()
         subtotal = Decimal("0")
@@ -102,8 +106,22 @@ class EcommerceOrderService:
         tax = (subtotal * Decimal(str(settings.ecommerce_tax_rate_percent)) / Decimal("100")).quantize(
             Decimal("0.01")
         )
-        order_amount = subtotal + shipping_cost + tax
+        order_amount = max(subtotal + shipping_cost + tax - coupon_discount, Decimal("0"))
         return order_amount, discount_total, tax, subtotal
+
+    @staticmethod
+    async def _resolve_coupon(
+        db: AsyncSession,
+        owner: CartOwnerContext,
+        coupon_code: str | None,
+        shipping_map: dict,
+    ) -> tuple[EcommerceCoupon | None, dict[UUID, Decimal]]:
+        if not coupon_code or owner.is_guest:
+            return None, {}
+        coupon, _, split = await EcommerceCouponService.calculate_discount(
+            db, owner, coupon_code, shipping_map=shipping_map
+        )
+        return coupon, split
 
     @staticmethod
     async def generate_orders_from_cart(
@@ -117,6 +135,7 @@ class EcommerceOrderService:
         address_id: UUID | None = None,
         order_note: str | None = None,
         paid_amount: Decimal | None = None,
+        coupon_code: str | None = None,
     ) -> list[UUID]:
         items = await EcommerceOrderService._load_checked_cart(db, owner)
         await EcommerceOrderService._validate_cart_stock(db, items)
@@ -136,6 +155,11 @@ class EcommerceOrderService:
         for item in items:
             grouped[item.shop_id].append(item)
 
+        coupon, coupon_split = await EcommerceOrderService._resolve_coupon(
+            db, owner, coupon_code, shipping_map
+        )
+        is_free_delivery = coupon and coupon.coupon_type.value == "free_delivery"
+
         order_group_id = uuid4()
         created_order_ids: list[UUID] = []
 
@@ -143,9 +167,10 @@ class EcommerceOrderService:
             shipping = shipping_map.get(shop_id) or shipping_map.get(shop_items[0].cart_group_id)
             if not shipping:
                 raise AppError(400, "Shipping not selected for shop", "shipping_required")
-            shipping_cost = shipping.shipping_cost
+            shipping_cost = Decimal("0") if is_free_delivery else shipping.shipping_cost
+            shop_coupon_discount = coupon_split.get(shop_id, Decimal("0"))
             order_amount, discount_total, tax, _ = await EcommerceOrderService._totals_for_group(
-                shop_items, shipping_cost
+                shop_items, shipping_cost, coupon_discount=shop_coupon_discount
             )
             paid = paid_amount if paid_amount is not None else (
                 order_amount if payment_status == EcommercePaymentStatus.PAID else Decimal("0")
@@ -170,6 +195,8 @@ class EcommerceOrderService:
                 shipping_address_id=resolved_address_id,
                 shipping_address_snapshot=address_snapshot,
                 order_note=order_note,
+                coupon_code=coupon.code if coupon else None,
+                coupon_discount=shop_coupon_discount,
             )
             db.add(order)
             await db.flush()
@@ -200,6 +227,11 @@ class EcommerceOrderService:
                 )
             created_order_ids.append(order.id)
 
+        if coupon and customer_id:
+            await EcommerceCouponService.record_usage(
+                db, coupon.id, customer_id, order_group_id
+            )
+
         owner_filter = EcommerceCartService._owner_filter(owner)
         checked_ids = [item.id for item in items]
         await db.execute(
@@ -213,12 +245,20 @@ class EcommerceOrderService:
         return created_order_ids
 
     @staticmethod
-    async def checkout_total(db: AsyncSession, owner: CartOwnerContext) -> Decimal:
+    async def checkout_total(
+        db: AsyncSession,
+        owner: CartOwnerContext,
+        coupon_code: str | None = None,
+    ) -> Decimal:
         items = await EcommerceOrderService._load_checked_cart(db, owner)
         cart_groups = {item.cart_group_id for item in items}
         shipping_map = await EcommerceShippingService.require_shipping_for_groups(
             db, owner, cart_groups
         )
+        coupon, coupon_split = await EcommerceOrderService._resolve_coupon(
+            db, owner, coupon_code, shipping_map
+        )
+        is_free_delivery = coupon and coupon.coupon_type.value == "free_delivery"
         grouped: dict[UUID, list[EcommerceCartItem]] = defaultdict(list)
         for item in items:
             grouped[item.shop_id].append(item)
@@ -226,9 +266,12 @@ class EcommerceOrderService:
         total = Decimal("0")
         for shop_id, shop_items in grouped.items():
             shipping = shipping_map.get(shop_id) or shipping_map.get(shop_items[0].cart_group_id)
-            shipping_cost = shipping.shipping_cost if shipping else Decimal("0")
+            shipping_cost = Decimal("0") if is_free_delivery else (
+                shipping.shipping_cost if shipping else Decimal("0")
+            )
+            shop_coupon_discount = coupon_split.get(shop_id, Decimal("0"))
             order_amount, _, _, _ = await EcommerceOrderService._totals_for_group(
-                shop_items, shipping_cost
+                shop_items, shipping_cost, coupon_discount=shop_coupon_discount
             )
             total += order_amount
         return total
@@ -239,6 +282,7 @@ class EcommerceOrderService:
         owner: CartOwnerContext,
         address_id: UUID | None = None,
         order_note: str | None = None,
+        coupon_code: str | None = None,
     ) -> dict:
         order_ids = await EcommerceOrderService.generate_orders_from_cart(
             db,
@@ -248,12 +292,14 @@ class EcommerceOrderService:
             payment_status=EcommercePaymentStatus.UNPAID,
             address_id=address_id,
             order_note=order_note,
+            coupon_code=coupon_code,
         )
         orders = (
             await db.execute(
                 select(EcommerceOrder).where(EcommerceOrder.id.in_(order_ids))
             )
         ).scalars().all()
+        await EcommerceOrderService._notify_order_placed(db, list(orders))
         return {
             "order_ids": [order.id for order in orders],
             "order_numbers": [order.public_id for order in orders],
@@ -269,10 +315,9 @@ class EcommerceOrderService:
         payer_phone: str | None,
         address_id: UUID | None = None,
         order_note: str | None = None,
+        coupon_code: str | None = None,
     ) -> EcommercePaymentRequest:
-        from app.services.ecommerce.pesapal_service import PesapalService
-
-        total = await EcommerceOrderService.checkout_total(db, owner)
+        total = await EcommerceOrderService.checkout_total(db, owner, coupon_code=coupon_code)
         payment = EcommercePaymentRequest(
             owner_id=owner.owner_id,
             is_guest=owner.is_guest,
@@ -283,6 +328,7 @@ class EcommerceOrderService:
                 {
                     "address_id": str(address_id) if address_id else None,
                     "order_note": order_note,
+                    "coupon_code": coupon_code,
                 }
             ),
         )
@@ -303,6 +349,7 @@ class EcommerceOrderService:
         additional = payment.additional()
         address_id = UUID(additional["address_id"]) if additional.get("address_id") else None
         order_note = additional.get("order_note")
+        coupon_code = additional.get("coupon_code")
 
         order_ids = await EcommerceOrderService.generate_orders_from_cart(
             db,
@@ -314,11 +361,16 @@ class EcommerceOrderService:
             address_id=address_id,
             order_note=order_note,
             paid_amount=payment.payment_amount,
+            coupon_code=coupon_code,
         )
         payment.is_paid = True
         payment.transaction_id = transaction_ref
         payment.order_ids_json = json.dumps([str(order_id) for order_id in order_ids])
         await db.flush()
+        orders = (
+            await db.execute(select(EcommerceOrder).where(EcommerceOrder.id.in_(order_ids)))
+        ).scalars().all()
+        await EcommerceOrderService._notify_order_placed(db, list(orders))
         return order_ids
 
     @staticmethod
@@ -408,6 +460,28 @@ class EcommerceOrderService:
         return await EcommerceOrderService._serialize_order(order, items)
 
     @staticmethod
+    async def _notify_order_placed(db: AsyncSession, orders: list[EcommerceOrder]) -> None:
+        from app.models.ecommerce.accounts import CustomerAccount
+        from app.services.ecommerce.notification_service import EcommerceNotificationService
+
+        if not orders or not orders[0].customer_id:
+            return
+        customer = await db.get(CustomerAccount, orders[0].customer_id)
+        if not customer:
+            return
+        numbers = ", ".join(o.public_id for o in orders)
+        total = sum(o.order_amount for o in orders)
+        await EcommerceNotificationService.notify_customer(
+            db,
+            customer_id=customer.id,
+            title="Order placed successfully",
+            body=f"Your order(s) {numbers} totaling UGX {total:,.0f} have been placed.",
+            notification_type="order_placed",
+            reference_id=orders[0].order_group_id,
+            email=customer.email,
+        )
+
+    @staticmethod
     async def cancel_order(db: AsyncSession, owner: CartOwnerContext, order_id: UUID) -> str:
         query = select(EcommerceOrder).where(
             EcommerceOrder.id == order_id,
@@ -420,11 +494,13 @@ class EcommerceOrderService:
         order = (await db.execute(query)).scalar_one_or_none()
         if not order:
             raise AppError(404, "Order not found", "order_not_found")
-        if (
-            order.payment_method != EcommercePaymentMethod.CASH_ON_DELIVERY
-            or order.order_status != EcommerceOrderStatus.PENDING
-        ):
+
+        cancellable_statuses = {EcommerceOrderStatus.PENDING, EcommerceOrderStatus.CONFIRMED}
+        if order.order_status not in cancellable_statuses:
             raise AppError(403, "Order status not changeable now", "status_not_changeable")
+        if order.payment_method == EcommercePaymentMethod.CASH_ON_DELIVERY:
+            if order.order_status != EcommerceOrderStatus.PENDING:
+                raise AppError(403, "Order status not changeable now", "status_not_changeable")
 
         group_orders = (
             await db.execute(
@@ -434,7 +510,10 @@ class EcommerceOrderService:
                 )
             )
         ).scalars().all()
+        refund_total = Decimal("0")
         for group_order in group_orders:
+            if group_order.payment_status == EcommercePaymentStatus.PAID:
+                refund_total += group_order.paid_amount or group_order.order_amount
             items = (
                 await db.execute(
                     select(EcommerceOrderItem).where(EcommerceOrderItem.order_id == group_order.id)
@@ -451,8 +530,55 @@ class EcommerceOrderService:
                     if product.stock_status == StockStatus.OUT_OF_STOCK and product.current_stock > 0:
                         product.stock_status = StockStatus.IN_STOCK
             group_order.order_status = EcommerceOrderStatus.CANCELED
+            if group_order.payment_status == EcommercePaymentStatus.PAID:
+                group_order.payment_status = EcommercePaymentStatus.REFUNDED
+
+        if refund_total > 0 and order.customer_id:
+            from app.services.ecommerce.wallet_service import EcommerceWalletService
+
+            await EcommerceWalletService.refund_order(
+                db, order.customer_id, refund_total, order.public_id
+            )
         await db.flush()
         return "order_canceled_successfully"
+
+    @staticmethod
+    async def place_wallet_order(
+        db: AsyncSession,
+        owner: CartOwnerContext,
+        address_id: UUID | None = None,
+        order_note: str | None = None,
+        coupon_code: str | None = None,
+    ) -> dict:
+        if owner.is_guest:
+            raise AppError(401, "Login required for wallet payment", "unauthorized")
+
+        total = await EcommerceOrderService.checkout_total(db, owner, coupon_code=coupon_code)
+        balance = await EcommerceWalletService.get_balance(db, owner.owner_id)
+        if balance < total:
+            raise AppError(400, "Insufficient wallet balance", "insufficient_balance")
+
+        order_ids = await EcommerceOrderService.generate_orders_from_cart(
+            db,
+            owner,
+            payment_method=EcommercePaymentMethod.WALLET,
+            order_status=EcommerceOrderStatus.CONFIRMED,
+            payment_status=EcommercePaymentStatus.PAID,
+            address_id=address_id,
+            order_note=order_note,
+            paid_amount=total,
+            coupon_code=coupon_code,
+        )
+        await EcommerceWalletService.debit_order_payment(db, owner.owner_id, total)
+        orders = (
+            await db.execute(select(EcommerceOrder).where(EcommerceOrder.id.in_(order_ids)))
+        ).scalars().all()
+        await EcommerceOrderService._notify_order_placed(db, list(orders))
+        return {
+            "order_ids": [order.id for order in orders],
+            "order_numbers": [order.public_id for order in orders],
+            "new_user": False,
+        }
 
     @staticmethod
     async def resolve_payer(db: AsyncSession, owner: CartOwnerContext) -> tuple[str, str, str | None]:

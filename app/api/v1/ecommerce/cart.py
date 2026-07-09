@@ -14,7 +14,7 @@ from app.schemas.ecommerce.cart import (
 )
 from app.services.ecommerce.cart_service import EcommerceCartService
 
-router = APIRouter(prefix="/cart", tags=["E-Commerce · Cart"])
+router = APIRouter(prefix="/cart")
 
 
 @router.get("/")

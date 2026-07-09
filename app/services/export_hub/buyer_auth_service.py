@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.shared.exceptions import AppError
@@ -21,6 +22,10 @@ from app.schemas.export_hub.auth import (
 )
 from app.services.shared.auth_session import create_login_session, refresh_session, revoke_refresh_session
 from app.services.export_hub.buyer_activation_service import BuyerActivationService
+from app.services.export_hub.buyer_account_cleanup import (
+    buyer_account_has_active_org,
+    hard_purge_buyer_account,
+)
 from app.utils.audit import apply_create_audit, apply_update_audit
 
 
@@ -56,11 +61,14 @@ class BuyerAuthService:
 
     @staticmethod
     async def register(db: AsyncSession, data: BuyerRegisterRequest) -> BuyerRegisterResponse:
-        existing = await db.execute(
-            select(BuyerAccount).where(BuyerAccount.email == data.email, BuyerAccount.deleted_at.is_(None))
-        )
-        if existing.scalar_one_or_none():
-            raise AppError(409, "Email already registered", "email_taken")
+        existing = (
+            await db.execute(select(BuyerAccount).where(BuyerAccount.email == data.email))
+        ).scalar_one_or_none()
+        if existing:
+            if existing.deleted_at or not await buyer_account_has_active_org(db, existing.id):
+                await hard_purge_buyer_account(db, existing.id)
+            else:
+                raise AppError(409, "Email already registered", "email_taken")
 
         account = BuyerAccount(
             id=uuid4(),
@@ -74,7 +82,12 @@ class BuyerAuthService:
         )
         apply_create_audit(account, account.id)
         db.add(account)
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            if "buyer_accounts_email" in str(exc.orig) or "ix_buyer_accounts_email" in str(exc.orig):
+                raise AppError(409, "Email already registered", "email_taken") from exc
+            raise
 
         org = BuyerOrganization(
             name=data.company,

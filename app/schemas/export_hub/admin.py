@@ -14,6 +14,11 @@ class VerifyRequest(BaseModel):
 
 class AdminNotificationsSummary(BaseModel):
     unread_count: int
+    rfq_queue: int = 0
+    deal_relay: int = 0
+    orders: int = 0
+    verification: int = 0
+    buyers: int = 0
 
 
 class RfqAssignRequest(BaseModel):
@@ -24,6 +29,18 @@ class RfqAssignRequest(BaseModel):
 class RelayQuoteRequest(BaseModel):
     quote_id: UUID | None = None
     message: str | None = None
+
+
+class AdminMessageRequest(BaseModel):
+    body: str
+
+
+class AdminMessageRouteRequest(BaseModel):
+    note: str | None = None
+
+
+class AdminMessageRevertRequest(BaseModel):
+    remarks: str
 
 
 class AdminPipelineStage(BaseModel):
@@ -67,6 +84,7 @@ class AdminRfqListItem(BaseModel):
     status: str
     assigned_admin_name: str | None
     action: str
+    pending_message_count: int = 0
 
 
 class AdminRfqListSummary(BaseModel):
@@ -74,6 +92,7 @@ class AdminRfqListSummary(BaseModel):
     total: int
     avg_response_hours: float | None
     active_this_week: int
+    needs_review_count: int = 0
 
 
 class AdminRfqListResponse(BaseModel):
@@ -98,10 +117,12 @@ class AdminDealListItem(BaseModel):
     status: str
     last_activity_at: datetime | None
     assigned_admin_name: str | None
+    pending_message_count: int = 0
 
 
 class AdminDealListResponse(BaseModel):
     active_deals_count: int
+    needs_review_count: int = 0
     items: list[AdminDealListItem]
     page: int
     page_size: int
@@ -235,3 +256,30 @@ class EscrowReleaseResponse(BaseModel):
     public_id: str
     payment_status: str
     released: bool
+
+
+class AdminProductFeaturedUpdate(BaseModel):
+    featured: bool
+
+
+class AdminProductListItem(BaseModel):
+    id: UUID
+    sku: str
+    name: str
+    supplier_name: str
+    supplier_org_id: UUID
+    category: str | None
+    status: str
+    featured: bool
+    price_display: str
+    image_url: str | None
+    updated_at: datetime
+
+
+class AdminProductListResponse(BaseModel):
+    items: list[AdminProductListItem]
+    page: int
+    page_size: int
+    total: int
+    pages: int
+    featured_count: int

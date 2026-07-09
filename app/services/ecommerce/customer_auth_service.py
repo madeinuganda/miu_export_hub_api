@@ -34,6 +34,7 @@ class EcommerceCustomerAuthService:
             customer_type=account.customer_type,
             must_change_password=account.must_change_password,
             email_verified=account.email_verified_at is not None,
+            wallet_balance=float(account.wallet_balance),
         )
 
     @staticmethod

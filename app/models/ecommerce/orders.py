@@ -16,6 +16,7 @@ from app.models.shared.enums import (
     EcommerceDiscountType,
     EcommerceOrderStatus,
     EcommercePaymentMethod,
+    EcommercePaymentPurpose,
     EcommercePaymentStatus,
 )
 
@@ -66,6 +67,8 @@ class EcommerceOrder(AuditMixin, Base):
     shipping_address_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True)
     shipping_address_snapshot: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     order_note: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    coupon_code: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    coupon_discount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal("0"), nullable=False)
 
 
 class EcommerceOrderItem(AuditMixin, Base):
@@ -98,6 +101,11 @@ class EcommercePaymentRequest(AuditMixin, Base):
     currency_code: Mapped[str] = mapped_column(String(8), default="UGX", nullable=False)
     is_paid: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     payment_method: Mapped[str] = mapped_column(String(32), default="pesapal", nullable=False)
+    purpose: Mapped[EcommercePaymentPurpose] = mapped_column(
+        str_enum(EcommercePaymentPurpose, name="ecommerce_payment_purpose"),
+        default=EcommercePaymentPurpose.ORDER_CHECKOUT,
+        nullable=False,
+    )
     transaction_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     payer_information: Mapped[str] = mapped_column(Text, nullable=False)
     additional_data: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

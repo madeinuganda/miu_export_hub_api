@@ -13,6 +13,7 @@ class CategoryCreate(BaseModel):
     parent_id: UUID | None = None
     sort_order: int = 0
     is_active: bool = True
+    featured: bool = False
     image_url: str | None = Field(default=None, max_length=512)
     thumb_url: str | None = Field(default=None, max_length=512)
 
@@ -24,6 +25,7 @@ class CategoryUpdate(BaseModel):
     parent_id: UUID | None = None
     sort_order: int | None = None
     is_active: bool | None = None
+    featured: bool | None = None
     image_url: str | None = Field(default=None, max_length=512)
     thumb_url: str | None = Field(default=None, max_length=512)
 
@@ -36,6 +38,7 @@ class CategoryItem(BaseModel):
     parent_id: UUID | None
     sort_order: int
     is_active: bool
+    featured: bool
     image_url: str | None
     thumb_url: str | None
     product_count: int

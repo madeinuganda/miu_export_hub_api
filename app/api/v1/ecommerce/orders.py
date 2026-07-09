@@ -13,6 +13,7 @@ from app.core.shared.database import get_db
 from app.core.shared.exceptions import AppError
 from app.models.ecommerce.accounts import CustomerAccount
 from app.models.ecommerce.orders import EcommercePaymentRequest
+from app.models.shared.enums import EcommercePaymentPurpose
 from app.schemas.ecommerce.order import (
     DigitalPaymentRequest,
     DigitalPaymentResponse,
@@ -20,20 +21,38 @@ from app.schemas.ecommerce.order import (
 )
 from app.services.ecommerce.order_service import EcommerceOrderService
 from app.services.ecommerce.pesapal_service import PesapalService
+from app.services.ecommerce.wallet_service import EcommerceWalletService
 
-router = APIRouter(tags=["E-Commerce · Orders & Payments"])
+router = APIRouter()
 
 
 @router.get("/customer/order/place", response_model=PlaceOrderResponse)
 async def place_order_cod(
     address_id: UUID | None = Query(None),
     order_note: str | None = Query(None),
+    coupon_code: str | None = Query(None),
     owner: CartOwnerContext = Depends(get_cart_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """Cash on delivery — Laravel GET /customer/order/place parity."""
     result = await EcommerceOrderService.place_cod_order(
-        db, owner, address_id=address_id, order_note=order_note
+        db, owner, address_id=address_id, order_note=order_note, coupon_code=coupon_code
+    )
+    await db.commit()
+    return PlaceOrderResponse(**result)
+
+
+@router.get("/customer/order/place-by-wallet", response_model=PlaceOrderResponse)
+async def place_order_wallet(
+    address_id: UUID | None = Query(None),
+    order_note: str | None = Query(None),
+    coupon_code: str | None = Query(None),
+    account: CustomerAccount = Depends(get_current_customer),
+    db: AsyncSession = Depends(get_db),
+):
+    owner = CartOwnerContext(owner_id=account.id, is_guest=False)
+    result = await EcommerceOrderService.place_wallet_order(
+        db, owner, address_id=address_id, order_note=order_note, coupon_code=coupon_code
     )
     await db.commit()
     return PlaceOrderResponse(**result)
@@ -92,6 +111,7 @@ async def initiate_digital_payment(
         payer_phone=phone,
         address_id=data.address_id,
         order_note=data.order_note,
+        coupon_code=data.coupon_code,
     )
     await db.commit()
 
@@ -125,11 +145,16 @@ async def pesapal_pay_redirect(
         f"?payment_id={payment.id}"
     )
     payer = payment.payer()
+    description = (
+        "Wallet top-up"
+        if payment.purpose == EcommercePaymentPurpose.WALLET_TOPUP
+        else f"Order {payment.id}"
+    )
     redirect_url = await PesapalService.submit_order_request(
         payment_id=str(payment.id),
         amount=payment.payment_amount,
         currency=payment.currency_code,
-        description=f"Order {payment.id}",
+        description=description,
         callback_url=callback_url,
         payer=payer,
     )
@@ -141,6 +166,17 @@ async def _process_pesapal_payment(
     payment: EcommercePaymentRequest,
     order_tracking_id: str,
 ) -> bool:
+    if payment.purpose == EcommercePaymentPurpose.WALLET_TOPUP:
+        if payment.is_paid:
+            return True
+        status_payload = await PesapalService.get_transaction_status(order_tracking_id)
+        if PesapalService.is_payment_successful(
+            status_payload, payment.payment_amount, payment.currency_code
+        ):
+            await EcommerceWalletService.fulfill_topup(db, payment, order_tracking_id)
+            return True
+        return False
+
     status_payload = await PesapalService.get_transaction_status(order_tracking_id)
     if PesapalService.is_payment_successful(
         status_payload, payment.payment_amount, payment.currency_code
@@ -179,6 +215,15 @@ async def pesapal_callback(
 
     success = await _process_pesapal_payment(db, payment, OrderTrackingId)
     await db.commit()
+    base = settings.ecommerce_frontend_base_url.rstrip("/")
+    if payment.purpose == EcommercePaymentPurpose.WALLET_TOPUP:
+        if success:
+            return RedirectResponse(
+                url=f"{base}/wallet/success?payment_id={payment.id}",
+                status_code=302,
+            )
+        return RedirectResponse(url=f"{base}/wallet?status=failed", status_code=302)
+
     if success:
         return RedirectResponse(
             url=f"{settings.ecommerce_frontend_base_url}/checkout/success?payment_id={payment.id}",

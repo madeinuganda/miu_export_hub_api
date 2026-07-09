@@ -3,27 +3,14 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
-from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ecommerce.deps import CartOwnerContext, get_cart_owner
-from app.core.shared.config import get_settings
 from app.core.shared.database import get_db
-from app.core.shared.exceptions import AppError
-from app.models.ecommerce.orders import EcommercePaymentRequest
-from app.schemas.ecommerce.order import (
-    ChooseShippingRequest,
-    DigitalPaymentRequest,
-    DigitalPaymentResponse,
-    PlaceOrderRequest,
-    PlaceOrderResponse,
-)
-from app.services.ecommerce.order_service import EcommerceOrderService
-from app.services.ecommerce.pesapal_service import PesapalService
+from app.schemas.ecommerce.order import ChooseShippingRequest
 from app.services.ecommerce.shipping_service import EcommerceShippingService
-from sqlalchemy import select
 
-router = APIRouter(tags=["E-Commerce · Shipping"])
+router = APIRouter()
 
 
 @router.get("/shipping-method/by-seller/{shop_id}/{seller_is}")

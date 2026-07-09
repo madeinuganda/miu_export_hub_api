@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1.export_hub import admin, auth, buyer, buyer_onboarding, public, supplier
+from app.api.v1.export_hub import admin, auth, buyer, buyer_onboarding, payments, public, supplier
 
 router = APIRouter(prefix="/export-hub")
 
@@ -12,3 +12,4 @@ router.include_router(buyer_onboarding.router, tags=["Export Hub · Buyer Onboar
 router.include_router(buyer.router, tags=["Export Hub · Buyer"])
 router.include_router(supplier.router, tags=["Export Hub · Supplier"])
 router.include_router(admin.router, tags=["Export Hub · Admin"])
+router.include_router(payments.router, tags=["Export Hub · Payments"])

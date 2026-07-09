@@ -38,7 +38,7 @@ from app.services.shared.password_reset_service import PasswordResetService
 from app.services.shared.rbac_service import RbacService
 from app.services.export_hub.supplier_auth_service import SupplierAuthService
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="/auth")
 
 
 def _client_meta(request: Request) -> tuple[str | None, str | None]:

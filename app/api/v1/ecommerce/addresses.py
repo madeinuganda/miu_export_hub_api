@@ -13,7 +13,7 @@ from app.schemas.ecommerce.address import (
 )
 from app.services.ecommerce.address_service import EcommerceAddressService
 
-router = APIRouter(prefix="/customer/address", tags=["E-Commerce · Addresses"])
+router = APIRouter(prefix="/customer/address")
 
 
 @router.get("/list", response_model=list[ShippingAddressResponse])

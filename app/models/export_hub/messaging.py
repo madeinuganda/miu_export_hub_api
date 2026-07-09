@@ -1,39 +1,20 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import BigInteger, DateTime, Enum, String, Text
+from sqlalchemy import BigInteger, String
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.shared.base import AuditMixin
-from app.models.shared.enums import ConversationType, SenderRole
 from app.core.shared.database import Base
 
 
-class ConversationThread(AuditMixin, Base):
-    __tablename__ = "conversation_threads"
-
-    thread_type: Mapped[ConversationType] = mapped_column(Enum(ConversationType, name="conversation_type"), nullable=False)
-    buyer_org_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True, index=True)
-    supplier_org_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True, index=True)
-    subject: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-
-
-class ConversationMessage(AuditMixin, Base):
-    __tablename__ = "conversation_messages"
-
-    thread_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
-    sender_role: Mapped[SenderRole] = mapped_column(Enum(SenderRole, name="message_sender_role"), nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False)
-    order_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True)
-    rfq_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True)
-    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-
 class MessageAttachment(AuditMixin, Base):
+    """A file attached to a message. `message_id` generically points at the
+    id of the message row (currently always an `RfqMessage`, which is the
+    single canonical thread for RFQ- and order-linked conversations)."""
+
     __tablename__ = "message_attachments"
 
     message_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)

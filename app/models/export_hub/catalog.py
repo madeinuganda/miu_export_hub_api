@@ -22,6 +22,7 @@ class Category(AuditMixin, Base):
     parent_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), ForeignKey("categories.id"), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     image_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     thumb_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
@@ -48,6 +49,9 @@ class Product(AuditMixin, Base):
     rating: Mapped[Decimal] = mapped_column(Numeric(3, 2), default=Decimal("5.0"), nullable=False)
     review_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_top_deal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    deal_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2), nullable=True)
 
 
 class ProductImage(AuditMixin, Base):

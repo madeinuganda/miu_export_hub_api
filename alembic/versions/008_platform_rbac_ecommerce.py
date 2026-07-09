@@ -15,9 +15,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    import app.models  # noqa: F401
-    import app.models.ecommerce_accounts  # noqa: F401
-    import app.models.rbac  # noqa: F401
+    import app.models  # noqa: F401 — registers all models, including ecommerce accounts and shared RBAC
     from app.core.shared.database import Base
 
     bind = op.get_bind()

@@ -49,6 +49,7 @@ class CustomerAccountSummary(BaseModel):
     customer_type: CustomerType
     must_change_password: bool
     email_verified: bool = False
+    wallet_balance: float = 0.0
 
 
 class EcommerceAdminAccountSummary(BaseModel):

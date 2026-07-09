@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,6 +40,7 @@ class CustomerAccount(_EcommerceAccountMixin, AuditMixin, Base):
     )
     referral_code: Mapped[Optional[str]] = mapped_column(String(32), unique=True, nullable=True)
     is_guest: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    wallet_balance: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal("0"), nullable=False)
 
 
 class CustomerSession(AuditMixin, Base):

@@ -184,6 +184,67 @@ class EmailService:
                 print(f"\n[MIU] Quote email for {to_email}: {rfq_public_id}\n{rfq_url}\n")
 
     @staticmethod
+    async def send_supplier_quote_accepted_email(
+        *,
+        to_email: str,
+        first_name: str,
+        rfq_public_id: str,
+        order_public_id: str,
+        product_name: str,
+        quantity_label: str,
+        offered_price: str,
+        order_url: str,
+    ) -> None:
+        subject = f"Quote accepted — {rfq_public_id} → {order_public_id}"
+        body = (
+            f"Hi {first_name},\n\n"
+            f"Great news — a buyer has accepted your quote on MIU Export Hub.\n\n"
+            f"RFQ: {rfq_public_id}\n"
+            f"Order: {order_public_id}\n"
+            f"Product: {product_name}\n"
+            f"Quantity: {quantity_label}\n"
+            f"Accepted price: {offered_price}\n\n"
+            f"View the order and next steps here:\n"
+            f"{order_url}\n\n"
+            f"The MIU Export Hub Team\n"
+        )
+        try:
+            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
+        except Exception:
+            logger.exception("Failed to send quote-accepted email to %s", to_email)
+            if get_settings().environment == "development":
+                print(f"\n[MIU] Quote accepted email for {to_email}: {order_public_id}\n")
+
+    @staticmethod
+    async def send_supplier_quote_declined_email(
+        *,
+        to_email: str,
+        first_name: str,
+        rfq_public_id: str,
+        product_name: str,
+        offered_price: str | None,
+        rfq_url: str,
+    ) -> None:
+        price_line = f"Offered price: {offered_price}\n" if offered_price else ""
+        subject = f"Quote declined — {rfq_public_id}"
+        body = (
+            f"Hi {first_name},\n\n"
+            f"A buyer has declined the quote for RFQ {rfq_public_id} on MIU Export Hub.\n\n"
+            f"RFQ: {rfq_public_id}\n"
+            f"Product: {product_name}\n"
+            f"{price_line}\n"
+            f"You can review the thread here:\n"
+            f"{rfq_url}\n\n"
+            f"The MIU Export Hub Team\n"
+        )
+        try:
+            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
+        except Exception:
+            logger.exception("Failed to send quote-declined email to %s", to_email)
+            if get_settings().environment == "development":
+                print(f"\n[MIU] Quote declined email for {to_email}: {rfq_public_id}\n")
+
+    @staticmethod
     async def send_deal_message_email(
         *,
         to_email: str,

@@ -158,6 +158,15 @@ class OrderService:
         quote.status = QuoteStatus.ACCEPTED
         apply_update_audit(rfq, user_id)
         apply_update_audit(quote, user_id)
+        from app.services.export_hub.rfq_service import RfqService
+        from app.utils.formatting import format_ugx
+
+        await RfqService.notify_supplier_quote_accepted(
+            db,
+            rfq,
+            order_public_id=order.public_id,
+            offered_price=format_ugx(quote.unit_price, rfq.unit),
+        )
         return {"orderId": order.public_id, "paymentLinkToken": token}
 
     @staticmethod

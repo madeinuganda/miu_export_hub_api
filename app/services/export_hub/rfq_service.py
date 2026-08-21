@@ -286,6 +286,92 @@ class RfqService:
         )
 
     @staticmethod
+    async def notify_supplier_quote_accepted(
+        db: AsyncSession,
+        rfq: Rfq,
+        *,
+        order_public_id: str,
+        offered_price: str,
+    ) -> None:
+        account = await RfqService._primary_supplier_account(db, rfq.supplier_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, rfq.product_id)
+        product_name = product.name if product else "Product"
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_supplier_quote_accepted_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            rfq_public_id=rfq.public_id,
+            order_public_id=order_public_id,
+            product_name=product_name,
+            quantity_label=format_quantity(rfq.quantity, rfq.unit),
+            offered_price=offered_price,
+            order_url=f"{base}/dashboard/supplier/orders/{order_public_id}",
+        )
+
+    @staticmethod
+    async def notify_supplier_quote_declined(
+        db: AsyncSession,
+        rfq: Rfq,
+        *,
+        offered_price: str | None = None,
+    ) -> None:
+        account = await RfqService._primary_supplier_account(db, rfq.supplier_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, rfq.product_id)
+        product_name = product.name if product else "Product"
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_supplier_quote_declined_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            rfq_public_id=rfq.public_id,
+            product_name=product_name,
+            offered_price=offered_price,
+            rfq_url=f"{base}/dashboard/supplier/rfq?id={rfq.public_id}",
+        )
+
+    @staticmethod
+    async def decline_buyer_rfq(
+        db: AsyncSession,
+        buyer_org_id: UUID,
+        user_id: UUID,
+        public_id: str,
+    ) -> dict:
+        rfq = (
+            await db.execute(
+                select(Rfq).where(
+                    Rfq.public_id == public_id,
+                    Rfq.buyer_org_id == buyer_org_id,
+                    Rfq.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if not rfq:
+            raise AppError(404, "RFQ not found", "not_found")
+        if rfq.status not in (RfqStatus.RESPONDED, RfqStatus.AWAITING):
+            raise AppError(400, "RFQ cannot be declined in its current status", "invalid_status")
+
+        quote = (
+            await db.execute(
+                select(RfqQuote)
+                .where(RfqQuote.rfq_id == rfq.id, RfqQuote.deleted_at.is_(None))
+                .order_by(RfqQuote.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        offered_price = format_ugx(quote.unit_price, rfq.unit) if quote else None
+        if quote and quote.status == QuoteStatus.SENT:
+            quote.status = QuoteStatus.DECLINED
+            apply_update_audit(quote, user_id)
+
+        rfq.status = RfqStatus.DECLINED
+        apply_update_audit(rfq, user_id)
+        await RfqService.notify_supplier_quote_declined(db, rfq, offered_price=offered_price)
+        return {"ok": True}
+
+    @staticmethod
     async def add_message(
         db: AsyncSession,
         rfq_id: UUID,

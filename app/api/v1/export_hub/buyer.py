@@ -351,12 +351,13 @@ async def accept_rfq(
 
 
 @router.post("/rfqs/{public_id}/decline")
-async def decline_rfq(public_id: str, db: AsyncSession = Depends(get_db), org_id: UUID = Depends(require_onboarded_buyer_org_id), account: BuyerAccount = Depends(require_buyer_password_changed)):
-    from app.models.shared.enums import RfqStatus
-    rfq = (await db.execute(select(Rfq).where(Rfq.public_id == public_id, Rfq.buyer_org_id == org_id))).scalar_one_or_none()
-    if rfq:
-        rfq.status = RfqStatus.DECLINED
-    return {"ok": True}
+async def decline_rfq(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    org_id: UUID = Depends(require_onboarded_buyer_org_id),
+    account: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    return await RfqService.decline_buyer_rfq(db, org_id, account.id, public_id)
 
 
 class RfqMessageRequest(BaseModel):

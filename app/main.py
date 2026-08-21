@@ -78,9 +78,37 @@ app.include_router(api_router)
 
 uploads_path = Path(settings.storage_path)
 uploads_path.mkdir(parents=True, exist_ok=True)
-# Prefer /api/uploads so prod proxies that only forward /api still serve files.
+
+
+def _resolve_upload_file(file_path: str) -> Path | None:
+    """Resolve a stored upload path, blocking directory traversal."""
+    candidate = (uploads_path / file_path).resolve()
+    root = uploads_path.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+@app.get("/api/uploads/{file_path:path}", include_in_schema=False)
+async def serve_api_upload(file_path: str):
+    """Serve uploads under ``/api/uploads`` for proxies that only forward ``/api``.
+
+    Prefer an explicit route over ``StaticFiles`` mounted at ``/api/uploads`` —
+    some Starlette/uvicorn combinations 404 that mount even when the file exists.
+    """
+    from fastapi.responses import FileResponse
+
+    resolved = _resolve_upload_file(file_path)
+    if resolved is None:
+        raise AppError(404, "File not found", "not_found")
+    return FileResponse(resolved)
+
+
 # Keep /uploads for older stored URLs and local tooling.
-app.mount("/api/uploads", StaticFiles(directory=str(uploads_path)), name="api_uploads")
 app.mount("/uploads", StaticFiles(directory=str(uploads_path)), name="uploads")
 
 

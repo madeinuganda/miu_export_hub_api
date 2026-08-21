@@ -26,7 +26,7 @@ from app.models.export_hub.misc import AdminActionLog, BuyerRegistrationDraft, B
 from app.models.export_hub.orders import Order, OrderActivity, OrderMilestone, OrderTracking
 from app.models.export_hub.organizations import BuyerOrganization, SupplierOrganization
 from app.models.export_hub.payments import PaymentEscrow, PaymentMilestone
-from app.models.export_hub.rfqs import Rfq, RfqQuote
+from app.models.export_hub.rfqs import Rfq, RfqMessage, RfqQuote
 from app.services.export_hub.order_service import (
     ADMIN_PIPELINE,
     PIPELINE_BY_STAGE,
@@ -56,6 +56,7 @@ from app.schemas.export_hub.admin import (
     VerificationDocumentItem,
     VerifyRequest,
 )
+from app.services.shared.email_service import EmailService
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
 from app.utils.formatting import format_quantity, format_ugx
 from app.utils.pagination import paginate
@@ -84,7 +85,7 @@ VERIFICATION_DOC_SPECS: list[tuple[str, str, list[str], bool]] = [
         ["sitePhotos", "production"],
         False,
     ),
-    ("contact", "Contact Information", ["contact"], False),
+    ("contact", "Contact Information", ["contact"], True),
 ]
 
 
@@ -424,6 +425,8 @@ class AdminService:
         )
         apply_create_audit(log, admin.id)
         db.add(log)
+        await db.flush()
+        await RfqService.notify_supplier_new_rfq(db, rfq, note=data.note)
         return {"ok": True, "public_id": rfq.public_id, "status": "routed"}
 
     @staticmethod
@@ -574,7 +577,15 @@ class AdminService:
         apply_update_audit(rfq, admin.id)
 
         if data.message:
-            await RfqService.add_message(db, rfq.id, SenderRole.ADMIN, data.message, admin.id)
+            msg = await RfqService.add_message(db, rfq.id, SenderRole.ADMIN, data.message, admin.id)
+            await AdminService._notify_deal_message_recipients(
+                db,
+                rfq,
+                msg,
+                notify_buyer=True,
+                notify_supplier=True,
+                sender_label="MIU Admin",
+            )
 
         log = AdminActionLog(
             admin_account_id=admin.id,
@@ -606,13 +617,85 @@ class AdminService:
         both parties immediately (no review needed since admin authored it)."""
         rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
         msg = await RfqService.add_message(db, rfq.id, SenderRole.ADMIN, body, admin.id)
+        await AdminService._notify_deal_message_recipients(
+            db,
+            rfq,
+            msg,
+            notify_buyer=True,
+            notify_supplier=True,
+            sender_label="MIU Admin",
+        )
         return RfqService._serialize_message(msg, admin_view=True)
 
     @staticmethod
     async def route_message(db: AsyncSession, admin: AdminAccount, public_id: str, message_id: UUID, note: str | None) -> dict:
         rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
         msg = await RfqService.route_message(db, admin.id, rfq.id, message_id, note)
+        # After routing, the counterparty can see it for the first time.
+        if msg.sender_role == SenderRole.BUYER:
+            await AdminService._notify_deal_message_recipients(
+                db,
+                rfq,
+                msg,
+                notify_buyer=False,
+                notify_supplier=True,
+                sender_label="Buyer (via MIU Admin)",
+            )
+        elif msg.sender_role == SenderRole.SUPPLIER:
+            await AdminService._notify_deal_message_recipients(
+                db,
+                rfq,
+                msg,
+                notify_buyer=True,
+                notify_supplier=False,
+                sender_label="Supplier (via MIU Admin)",
+            )
         return RfqService._serialize_message(msg, admin_view=True)
+
+    @staticmethod
+    async def _notify_deal_message_recipients(
+        db: AsyncSession,
+        rfq: Rfq,
+        msg: RfqMessage,
+        *,
+        notify_buyer: bool,
+        notify_supplier: bool,
+        sender_label: str,
+    ) -> None:
+        from app.core.shared.config import get_settings
+
+        settings = get_settings()
+        base = settings.frontend_base_url.rstrip("/")
+        order = (
+            await db.execute(
+                select(Order).where(Order.rfq_id == rfq.id, Order.deleted_at.is_(None)).limit(1)
+            )
+        ).scalar_one_or_none()
+        thread_ref = order.public_id if order else rfq.public_id
+        thread_label = order.public_id if order else rfq.public_id
+
+        if notify_buyer:
+            buyer = await AdminService._buyer_primary_account(db, rfq.buyer_org_id)
+            if buyer and buyer.email:
+                await EmailService.send_deal_message_email(
+                    to_email=buyer.email,
+                    first_name=buyer.first_name or "there",
+                    thread_label=thread_label,
+                    sender_label=sender_label,
+                    preview=msg.body,
+                    messages_url=f"{base}/dashboard/buyer/messages?thread={thread_ref}",
+                )
+        if notify_supplier:
+            supplier = await AdminService._primary_supplier_account(db, rfq.supplier_org_id)
+            if supplier and supplier.email:
+                await EmailService.send_deal_message_email(
+                    to_email=supplier.email,
+                    first_name=supplier.first_name or "there",
+                    thread_label=thread_label,
+                    sender_label=sender_label,
+                    preview=msg.body,
+                    messages_url=f"{base}/dashboard/supplier/messages?thread={thread_ref}",
+                )
 
     @staticmethod
     async def revert_message(db: AsyncSession, admin: AdminAccount, public_id: str, message_id: UUID, remarks: str) -> dict:
@@ -1004,22 +1087,20 @@ class AdminService:
 
     @staticmethod
     def _missing_items_from_documents(docs: list[VerificationDocumentItem]) -> list[str]:
-        return [
-            doc.label
-            for doc in docs
-            if doc.status in ("missing", "flagged") and doc.key != "contact"
-        ]
+        """Items the supplier must fix — flagged or missing (not pending admin review)."""
+        seen: set[str] = set()
+        items: list[str] = []
+        for doc in docs:
+            if doc.status not in ("missing", "flagged"):
+                continue
+            if doc.label in seen:
+                continue
+            seen.add(doc.label)
+            items.append(doc.label)
+        return items
 
     @staticmethod
     async def effective_verification_status(db: AsyncSession, org: SupplierOrganization) -> str:
-        """UI status: action_required when admin requested info (without DB enum value)."""
-        log = await AdminService._latest_info_request_log(db, org.id)
-        if not log:
-            return org.verification_status.value
-        if org.verification_status == VerificationStatus.PENDING:
-            return "action_required"
-        if org.verification_status == VerificationStatus.APPROVED and not org.storefront_published:
-            return "action_required"
         return org.verification_status.value
 
     @staticmethod
@@ -1031,14 +1112,94 @@ class AdminService:
         if log and isinstance(log.metadata_, dict):
             meta = log.metadata_
             if meta.get("missing_items"):
-                missing = list(meta["missing_items"])
+                # Prefer live doc statuses when available; fall back to logged list.
+                logged = list(meta["missing_items"])
+                missing = missing or logged
             message = meta.get("message")
         if not message:
             message = (
                 "MIU admin has requested updates to your application. "
                 "Please provide the missing information below."
             )
-        return {"message": message, "missingItems": missing}
+        attention_items = [
+            {
+                "key": doc.key,
+                "label": doc.label,
+                "status": doc.status,
+                "required": doc.required,
+            }
+            for doc in docs
+            if doc.status in ("missing", "flagged")
+        ]
+        return {
+            "message": message,
+            "missingItems": missing,
+            "attentionItems": attention_items,
+        }
+
+    @staticmethod
+    async def _primary_supplier_account(
+        db: AsyncSession, org_id: UUID
+    ) -> SupplierAccount | None:
+        member = (
+            await db.execute(
+                select(SupplierOrganizationMember)
+                .where(
+                    SupplierOrganizationMember.org_id == org_id,
+                    SupplierOrganizationMember.deleted_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if not member:
+            return None
+        return await db.get(SupplierAccount, member.supplier_account_id)
+
+    @staticmethod
+    async def _ensure_contact_document(
+        db: AsyncSession, org_id: UUID, account_id: UUID | None
+    ) -> RegistrationDocument:
+        existing = (
+            await db.execute(
+                select(RegistrationDocument).where(
+                    RegistrationDocument.org_id == org_id,
+                    RegistrationDocument.document_type == "contact",
+                    RegistrationDocument.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            return existing
+        doc = RegistrationDocument(
+            org_id=org_id,
+            document_type="contact",
+            file_id=None,
+            required=False,
+            status=DocumentStatus.PENDING,
+        )
+        apply_create_audit(doc, account_id)
+        db.add(doc)
+        await db.flush()
+        return doc
+
+    @staticmethod
+    async def _notify_supplier_action_required(
+        db: AsyncSession,
+        org: SupplierOrganization,
+        *,
+        message: str,
+        missing_items: list[str],
+    ) -> None:
+        account = await AdminService._primary_supplier_account(db, org.id)
+        if not account or not account.email:
+            return
+        await EmailService.send_supplier_action_required_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            company_name=org.name,
+            message=message,
+            missing_items=missing_items,
+        )
 
     @staticmethod
     def _draft_documents_payload(db_payload: dict | None) -> dict:
@@ -1122,102 +1283,132 @@ class AdminService:
         return merged
 
     @staticmethod
+    def _doc_ui_status(reg: RegistrationDocument | None, *, has_file: bool) -> str:
+        if not reg and not has_file:
+            return "missing"
+        if not reg:
+            return "pending"
+        if reg.status == DocumentStatus.APPROVED:
+            return "verified"
+        if reg.status == DocumentStatus.REJECTED:
+            return "flagged"
+        return "pending"
+
+    @staticmethod
     async def _verification_documents(db: AsyncSession, org_id: UUID) -> list[VerificationDocumentItem]:
         docs: list[VerificationDocumentItem] = []
         reg_docs = (
             await db.execute(
                 select(RegistrationDocument).where(
-                    RegistrationDocument.org_id == org_id, RegistrationDocument.deleted_at.is_(None)
+                    RegistrationDocument.org_id == org_id,
+                    RegistrationDocument.deleted_at.is_(None),
                 )
             )
         ).scalars().all()
-        reg_by_type = {d.document_type: d for d in reg_docs}
         payload_docs = await AdminService._org_draft_documents(db, org_id)
 
-        member = (
-            await db.execute(
-                select(SupplierOrganizationMember).where(
-                    SupplierOrganizationMember.org_id == org_id,
-                    SupplierOrganizationMember.deleted_at.is_(None),
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        account = None
-        if member:
-            account = await db.get(SupplierAccount, member.supplier_account_id)
-
         for key, label, aliases, required in VERIFICATION_DOC_SPECS:
+            matching = [
+                d
+                for d in reg_docs
+                if d.document_type in aliases or d.document_type == key
+            ]
+
             if key == "contact":
-                contact_ok = bool(
-                    account
-                    and account.email
-                    and account.phone
-                    and (account.first_name or account.last_name)
-                )
+                contact_doc = next((d for d in matching if d.document_type == "contact"), None)
                 docs.append(
                     VerificationDocumentItem(
                         key=key,
                         label=label,
-                        status="verified" if contact_ok else "flagged",
+                        status=AdminService._doc_ui_status(contact_doc, has_file=False)
+                        if contact_doc
+                        else "pending",
+                        required=True,
+                        has_file=False,
+                        document_id=contact_doc.id if contact_doc else None,
+                        file_id=None,
+                        filename=None,
+                        mime_type=None,
+                        file_url=None,
+                    )
+                )
+                continue
+
+            if not matching:
+                draft_entry = AdminService._pick_draft_doc_entry(payload_docs, aliases, key)
+                draft_file_id = AdminService._file_id_from_draft_entry(draft_entry)
+                if draft_file_id:
+                    record = await db.get(FileRecord, draft_file_id)
+                    if record and not record.deleted_at:
+                        docs.append(
+                            VerificationDocumentItem(
+                                key=key,
+                                label=label,
+                                status="pending",
+                                required=required,
+                                has_file=True,
+                                document_id=None,
+                                file_id=draft_file_id,
+                                filename=(
+                                    draft_entry.get("filename")
+                                    if isinstance(draft_entry, dict)
+                                    else None
+                                )
+                                or Path(record.storage_key).name,
+                                mime_type=record.mime_type,
+                                file_url=None,
+                            )
+                        )
+                        continue
+                docs.append(
+                    VerificationDocumentItem(
+                        key=key,
+                        label=label,
+                        status="missing",
                         required=required,
                         has_file=False,
                     )
                 )
                 continue
 
-            reg = AdminService._pick_registration_doc(reg_by_type, aliases)
-            draft_entry = AdminService._pick_draft_doc_entry(payload_docs, aliases, key)
+            for idx, reg in enumerate(matching):
+                record = await db.get(FileRecord, reg.file_id) if reg.file_id else None
+                if record and record.deleted_at:
+                    record = None
+                has_file = bool(reg.file_id and record)
+                item_label = label if len(matching) == 1 else f"{label} ({idx + 1})"
+                filename = None
+                draft_entry = AdminService._pick_draft_doc_entry(payload_docs, aliases, key)
+                if isinstance(draft_entry, dict):
+                    files = draft_entry.get("files")
+                    if isinstance(files, list):
+                        for f in files:
+                            if (
+                                isinstance(f, dict)
+                                and str(f.get("fileId") or f.get("file_id") or "")
+                                == str(reg.file_id or "")
+                            ):
+                                filename = f.get("filename")
+                                break
+                    if not filename:
+                        filename = draft_entry.get("filename")
+                if not filename and record:
+                    filename = Path(record.storage_key).name
 
-            file_id: UUID | None = reg.file_id if reg and reg.file_id else None
-            filename: str | None = None
-            if draft_entry:
-                filename = draft_entry.get("filename")
-                if not file_id:
-                    file_id = AdminService._file_id_from_draft_entry(draft_entry)
-
-            if not file_id:
-                for alias in aliases + [key]:
-                    candidate = reg_by_type.get(alias)
-                    if candidate and candidate.file_id:
-                        file_id = candidate.file_id
-                        reg = candidate
-                        break
-
-            record = await db.get(FileRecord, file_id) if file_id else None
-            if record and record.deleted_at:
-                record = None
-
-            if not file_id or not record:
-                status = "missing"
-                mime_type = None
-                has_file = False
-            elif reg and reg.status == DocumentStatus.APPROVED:
-                status = "verified"
-                mime_type = record.mime_type
-                has_file = True
-            elif reg and reg.status == DocumentStatus.REJECTED:
-                status = "flagged"
-                mime_type = record.mime_type
-                has_file = True
-            else:
-                status = "flagged"
-                mime_type = record.mime_type
-                has_file = True
-
-            docs.append(
-                VerificationDocumentItem(
-                    key=key,
-                    label=label,
-                    status=status,
-                    required=required,
-                    has_file=has_file,
-                    file_id=file_id if has_file else None,
-                    filename=filename or (Path(record.storage_key).name if record else None),
-                    mime_type=mime_type,
-                    file_url=None,
+                docs.append(
+                    VerificationDocumentItem(
+                        key=key,
+                        label=item_label,
+                        status=AdminService._doc_ui_status(reg, has_file=has_file),
+                        required=required,
+                        has_file=has_file,
+                        document_id=reg.id,
+                        file_id=reg.file_id if has_file else None,
+                        filename=filename,
+                        mime_type=record.mime_type if record else None,
+                        file_url=None,
+                    )
                 )
-            )
         return docs
 
     @staticmethod
@@ -1346,6 +1537,8 @@ class AdminService:
         org = await db.get(SupplierOrganization, application_id)
         if not org or org.deleted_at:
             raise AppError(404, "Application not found", "not_found")
+        account = await AdminService._primary_supplier_account(db, org.id)
+        await AdminService._ensure_contact_document(db, org.id, account.id if account else None)
         return await AdminService._serialize_verification_app(db, org)
 
     @staticmethod
@@ -1357,6 +1550,8 @@ class AdminService:
         if data.approved:
             org.approved_at = datetime.now(timezone.utc)
             org.storefront_published = True
+        else:
+            org.storefront_published = False
         apply_update_audit(org, admin.id)
         log = AdminActionLog(
             admin_account_id=admin.id,
@@ -1367,7 +1562,66 @@ class AdminService:
         )
         apply_create_audit(log, admin.id)
         db.add(log)
+
+        if data.approved:
+            account = await AdminService._primary_supplier_account(db, org.id)
+            if account and account.email:
+                await EmailService.send_supplier_verified_email(
+                    to_email=account.email,
+                    first_name=account.first_name or "there",
+                    company_name=org.name,
+                )
         return {"status": org.verification_status.value}
+
+    @staticmethod
+    async def _open_action_required(
+        db: AsyncSession,
+        admin: AdminAccount,
+        org: SupplierOrganization,
+        *,
+        message: str | None,
+        missing_items: list[str],
+        notify: bool = True,
+    ) -> dict:
+        default_message = (
+            "Please update your application with the missing or flagged items listed below."
+        )
+        final_message = message or default_message
+        if not missing_items:
+            missing_items = ["Additional documentation or clarification"]
+
+        was_approved = org.verification_status == VerificationStatus.APPROVED
+        org.verification_status = VerificationStatus.ACTION_REQUIRED
+        org.storefront_published = False
+        apply_update_audit(org, admin.id)
+
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="request_verification_info",
+            entity_type="supplier_org",
+            entity_id=org.id,
+            metadata_={
+                "message": final_message,
+                "missing_items": missing_items,
+                "was_approved": was_approved,
+            },
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+
+        if notify:
+            await AdminService._notify_supplier_action_required(
+                db,
+                org,
+                message=final_message,
+                missing_items=missing_items,
+            )
+        return {
+            "ok": True,
+            "info_requested": True,
+            "status": org.verification_status.value,
+            "missing_items": missing_items,
+        }
 
     @staticmethod
     async def request_verification_info(
@@ -1379,38 +1633,20 @@ class AdminService:
         if org.verification_status not in (
             VerificationStatus.PENDING,
             VerificationStatus.APPROVED,
+            VerificationStatus.ACTION_REQUIRED,
         ):
             raise AppError(400, "Cannot request information for this application", "invalid_status")
 
         documents = await AdminService._verification_documents(db, org.id)
         missing_items = AdminService._missing_items_from_documents(documents)
-        if not missing_items:
-            missing_items = ["Additional documentation or clarification"]
-
-        org.storefront_published = False
-        apply_update_audit(org, admin.id)
-
-        default_message = (
-            "Please update your application with the missing or flagged items listed below."
+        return await AdminService._open_action_required(
+            db,
+            admin,
+            org,
+            message=message,
+            missing_items=missing_items,
+            notify=True,
         )
-        log = AdminActionLog(
-            admin_account_id=admin.id,
-            action="request_verification_info",
-            entity_type="supplier_org",
-            entity_id=org.id,
-            metadata_={
-                "message": message or default_message,
-                "missing_items": missing_items,
-            },
-        )
-        apply_create_audit(log, admin.id)
-        db.add(log)
-        return {
-            "ok": True,
-            "info_requested": True,
-            "status": org.verification_status.value,
-            "missing_items": missing_items,
-        }
 
     @staticmethod
     async def suspend_supplier(
@@ -1488,32 +1724,18 @@ class AdminService:
         )
         apply_create_audit(log, admin.id)
         db.add(log)
-        return {"ok": True, "status": doc.status.value}
+        return {"ok": True, "status": "verified", "document_id": str(doc.id)}
 
     @staticmethod
     async def reject_verification_document(
         db: AsyncSession, admin: AdminAccount, doc_id: UUID, reason: str | None
     ) -> dict:
-        doc = await AdminService._get_registration_document(db, doc_id)
-        doc.status = DocumentStatus.REJECTED
-        apply_update_audit(doc, admin.id)
-
-        log = AdminActionLog(
-            admin_account_id=admin.id,
-            action="verification_doc_rejected",
-            entity_type="registration_document",
-            entity_id=doc.id,
-            metadata_={"reason": reason},
-        )
-        apply_create_audit(log, admin.id)
-        db.add(log)
-        return {"ok": True, "status": doc.status.value}
+        return await AdminService.flag_verification_document(db, admin, doc_id, reason)
 
     @staticmethod
     async def flag_verification_document(
         db: AsyncSession, admin: AdminAccount, doc_id: UUID, reason: str | None
     ) -> dict:
-        # Represent "flagged" using REJECTED plus metadata so existing enums still apply.
         doc = await AdminService._get_registration_document(db, doc_id)
         doc.status = DocumentStatus.REJECTED
         apply_update_audit(doc, admin.id)
@@ -1527,7 +1749,93 @@ class AdminService:
         )
         apply_create_audit(log, admin.id)
         db.add(log)
-        return {"ok": True, "status": doc.status.value}
+
+        org = await db.get(SupplierOrganization, doc.org_id)
+        if org and not org.deleted_at:
+            documents = await AdminService._verification_documents(db, org.id)
+            missing_items = AdminService._missing_items_from_documents(documents)
+            label = next(
+                (d.label for d in documents if d.document_id == doc.id),
+                doc.document_type,
+            )
+            if label not in missing_items:
+                missing_items = [label, *missing_items]
+            await AdminService._open_action_required(
+                db,
+                admin,
+                org,
+                message=reason
+                or "One or more of your uploaded documents require attention.",
+                missing_items=missing_items,
+                notify=True,
+            )
+        return {"ok": True, "status": "flagged", "document_id": str(doc.id)}
+
+    @staticmethod
+    async def bulk_update_verification_documents(
+        db: AsyncSession,
+        admin: AdminAccount,
+        application_id: UUID,
+        *,
+        action: str,
+        document_ids: list[UUID],
+        message: str | None,
+    ) -> dict:
+        if action not in ("approve", "flag"):
+            raise AppError(400, "action must be approve or flag", "invalid_action")
+        if not document_ids:
+            raise AppError(400, "document_ids is required", "invalid_request")
+
+        org = await db.get(SupplierOrganization, application_id)
+        if not org or org.deleted_at:
+            raise AppError(404, "Application not found", "not_found")
+
+        updated: list[str] = []
+        labels: list[str] = []
+        for doc_id in document_ids:
+            doc = await AdminService._get_registration_document(db, doc_id)
+            if doc.org_id != org.id:
+                raise AppError(400, "Document does not belong to this application", "invalid_document")
+            if action == "approve":
+                doc.status = DocumentStatus.APPROVED
+                action_name = "verification_doc_approved"
+                ui_status = "verified"
+            else:
+                doc.status = DocumentStatus.REJECTED
+                action_name = "verification_doc_flagged"
+                ui_status = "flagged"
+            apply_update_audit(doc, admin.id)
+            log = AdminActionLog(
+                admin_account_id=admin.id,
+                action=action_name,
+                entity_type="registration_document",
+                entity_id=doc.id,
+                metadata_={"reason": message, "flagged": action == "flag", "bulk": True},
+            )
+            apply_create_audit(log, admin.id)
+            db.add(log)
+            updated.append(str(doc.id))
+            labels.append(doc.document_type)
+
+        if action == "flag":
+            documents = await AdminService._verification_documents(db, org.id)
+            missing_items = AdminService._missing_items_from_documents(documents)
+            await AdminService._open_action_required(
+                db,
+                admin,
+                org,
+                message=message
+                or "One or more of your uploaded documents require attention.",
+                missing_items=missing_items,
+                notify=True,
+            )
+
+        return {
+            "ok": True,
+            "action": action,
+            "updated": updated,
+            "status": org.verification_status.value,
+        }
 
     @staticmethod
     async def delete_verification_document(

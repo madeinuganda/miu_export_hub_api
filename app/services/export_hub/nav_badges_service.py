@@ -28,7 +28,12 @@ def _stage_needs_supplier_action(pipeline_index: int) -> bool:
     return PIPELINE_STAGE_IDS[pipeline_index] in ("in_production", "ready_to_dispatch")
 
 
-def _thread_needs_reply(msgs: list, viewer: SenderRole) -> bool:
+def _thread_needs_reply(
+    msgs: list,
+    viewer: SenderRole,
+    *,
+    last_read_at=None,
+) -> bool:
     if not msgs:
         return False
     last = msgs[-1]
@@ -37,10 +42,17 @@ def _thread_needs_reply(msgs: list, viewer: SenderRole) -> bool:
     if last.review_status != MessageReviewStatus.ROUTED:
         return False
     if viewer == SenderRole.SUPPLIER:
-        return last.sender_role in (SenderRole.BUYER, SenderRole.ADMIN)
-    if viewer == SenderRole.BUYER:
-        return last.sender_role in (SenderRole.SUPPLIER, SenderRole.ADMIN)
-    return False
+        needs = last.sender_role in (SenderRole.BUYER, SenderRole.ADMIN)
+    elif viewer == SenderRole.BUYER:
+        needs = last.sender_role in (SenderRole.SUPPLIER, SenderRole.ADMIN)
+    else:
+        return False
+    if not needs:
+        return False
+    # Viewing the thread clears the badge until a newer inbound message arrives.
+    if last_read_at is not None and last.sent_at is not None and last.sent_at <= last_read_at:
+        return False
+    return True
 
 
 class NavBadgesService:
@@ -49,8 +61,16 @@ class NavBadgesService:
         unique_ids = list(dict.fromkeys(rfq_ids))
         count = 0
         for rfq_id in unique_ids:
+            rfq = await db.get(Rfq, rfq_id)
+            if not rfq or rfq.deleted_at:
+                continue
             msgs = await RfqService._rfq_messages(db, rfq_id)
-            if _thread_needs_reply(msgs, viewer):
+            last_read_at = (
+                rfq.supplier_messages_read_at
+                if viewer == SenderRole.SUPPLIER
+                else rfq.buyer_messages_read_at
+            )
+            if _thread_needs_reply(msgs, viewer, last_read_at=last_read_at):
                 count += 1
         return count
 

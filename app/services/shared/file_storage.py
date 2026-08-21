@@ -78,5 +78,43 @@ async def store_upload_bytes(
 
 
 def public_file_url(storage_key: str) -> str:
+    """Build a public path for a stored file.
+
+    Paths are under ``/api/uploads`` so production reverse proxies that only
+    forward ``/api`` (e.g. exporthub.miu.ug) still serve gallery/logo assets.
+    """
     key = storage_key.lstrip("/")
-    return f"/uploads/{key}"
+    for prefix in ("api/uploads/", "uploads/"):
+        if key.startswith(prefix):
+            key = key[len(prefix) :]
+            break
+    return f"/api/uploads/{key}"
+
+
+def as_public_file_url(url: str | None) -> str | None:
+    """Normalize a stored image/document URL for API responses."""
+    if url is None:
+        return None
+    trimmed = url.strip()
+    if not trimmed:
+        return trimmed
+
+    if trimmed.startswith(("http://", "https://")):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(trimmed)
+        path = parsed.path or ""
+        if path.startswith("/uploads/"):
+            path = f"/api{path}"
+        elif not path.startswith("/api/uploads/"):
+            return trimmed
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"{path}{query}"
+
+    if trimmed.startswith("/uploads/"):
+        return f"/api{trimmed}"
+    if trimmed.startswith("uploads/"):
+        return f"/api/uploads/{trimmed[len('uploads/') :]}"
+    if trimmed.startswith("/api/uploads/") or trimmed.startswith("api/uploads/"):
+        return trimmed if trimmed.startswith("/") else f"/{trimmed}"
+    return trimmed

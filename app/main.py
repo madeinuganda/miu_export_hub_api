@@ -78,6 +78,9 @@ app.include_router(api_router)
 
 uploads_path = Path(settings.storage_path)
 uploads_path.mkdir(parents=True, exist_ok=True)
+# Prefer /api/uploads so prod proxies that only forward /api still serve files.
+# Keep /uploads for older stored URLs and local tooling.
+app.mount("/api/uploads", StaticFiles(directory=str(uploads_path)), name="api_uploads")
 app.mount("/uploads", StaticFiles(directory=str(uploads_path)), name="uploads")
 
 

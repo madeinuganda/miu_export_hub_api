@@ -18,6 +18,12 @@ from app.services.export_hub.rfq_service import RfqService
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
 from app.utils.formatting import format_quantity, format_ugx
 
+
+def _format_display_date(value: datetime | None) -> str:
+    if not value:
+        return ""
+    return f"{value.day} {value.strftime('%b %Y')}"
+
 # Canonical order lifecycle, shared by admin, supplier, and buyer views alike so
 # every role reads/writes the same `order_milestones` rows and never disagrees
 # about where an order stands.
@@ -327,8 +333,12 @@ class OrderService:
             )
         ).scalar_one_or_none()
         if not escrow:
-            return "Escrow secured", "muted"
+            return "Payment pending", "muted"
+        if escrow.status == EscrowStatus.PENDING:
+            return "Awaiting escrow payment", "muted"
         if escrow.status == EscrowStatus.BALANCE_RELEASED:
+            return "Fully paid", "positive"
+        if pipeline_index >= PIPELINE_BY_STAGE["delivered"][0]:
             return "Fully paid", "positive"
         if pipeline_index >= PIPELINE_BY_STAGE["in_production"][0]:
             return f"{format_ugx(escrow.balance_amount)} due", "muted"
@@ -342,14 +352,15 @@ class OrderService:
         payment_note, payment_tone = await OrderService._supplier_payment_note(db, order, pipeline_index)
         return {
             "id": order.public_id,
-            "date": order.created_at.date().isoformat(),
-            "country": buyer.country if buyer else "",
-            "product": product.name if product else "",
+            "date": _format_display_date(order.created_at),
+            "country": (buyer.country if buyer and buyer.country else "") or "N/A",
+            "product": product.name if product else "N/A",
             "quantity": format_quantity(order.quantity, order.unit),
             "value": format_ugx(order.total_value_amount),
             "paymentNote": payment_note,
             "paymentTone": payment_tone,
             "status": OrderService._coarse_supplier_status(PIPELINE_STAGE_IDS[pipeline_index]),
+            "pipelineStage": PIPELINE_STAGE_IDS[pipeline_index],
         }
 
     @staticmethod
@@ -438,15 +449,16 @@ class OrderService:
 
         escrow_legs = []
         if escrow:
+            upfront_secured = escrow.status != EscrowStatus.PENDING
+            balance_released = escrow.status == EscrowStatus.BALANCE_RELEASED
             escrow_legs.append(
                 {
                     "label": f"{escrow.upfront_percent}% upfront (escrow)",
                     "amount": format_ugx(escrow.upfront_amount),
-                    "note": order.created_at.date().isoformat(),
-                    "secured": True,
+                    "note": _format_display_date(order.created_at) if upfront_secured else "Awaiting payment",
+                    "secured": upfront_secured,
                 }
             )
-            balance_released = escrow.status == EscrowStatus.BALANCE_RELEASED
             escrow_legs.append(
                 {
                     "label": f"{100 - escrow.upfront_percent}% on delivery",
@@ -455,18 +467,74 @@ class OrderService:
                     "secured": balance_released,
                 }
             )
+        else:
+            escrow_legs = [
+                {
+                    "label": "70% upfront (escrow)",
+                    "amount": format_ugx(order.total_value_amount * Decimal("0.7")),
+                    "note": "Awaiting payment setup",
+                    "secured": False,
+                },
+                {
+                    "label": "30% on delivery",
+                    "amount": format_ugx(order.total_value_amount * Decimal("0.3")),
+                    "note": "Due on delivery",
+                    "secured": False,
+                },
+            ]
+
+        # Production milestones: prefer stored rows; otherwise derive from pipeline.
+        if milestones:
+            milestone_items = [
+                {"id": m.step_key, "label": m.label, "state": milestone_state_map.get(m.state, "upcoming")}
+                for m in milestones
+            ]
+        else:
+            production_labels = [
+                ("raw-materials", "Raw materials acquired"),
+                ("processing", "Processing begun"),
+                ("quality", "Quality inspection"),
+                ("packaging", "Packaging complete"),
+                ("collection", "Ready for collection"),
+            ]
+            if pipeline_index < PIPELINE_BY_STAGE["in_production"][0]:
+                milestone_items = [
+                    {"id": k, "label": label, "state": "current" if i == 0 else "upcoming"}
+                    for i, (k, label) in enumerate(production_labels)
+                ]
+            elif pipeline_index >= PIPELINE_BY_STAGE["ready_to_dispatch"][0]:
+                milestone_items = [
+                    {"id": k, "label": label, "state": "done"} for k, label in production_labels
+                ]
+            else:
+                # Mid production — mark first two done, third current
+                milestone_items = []
+                for i, (k, label) in enumerate(production_labels):
+                    if i < 2:
+                        state = "done"
+                    elif i == 2:
+                        state = "current"
+                    else:
+                        state = "upcoming"
+                    milestone_items.append({"id": k, "label": label, "state": state})
+
+        timeline = [
+            {"date": _format_display_date(a.occurred_at), "description": a.description} for a in activity
+        ]
+        if not timeline:
+            timeline = [
+                {
+                    "date": _format_display_date(order.created_at),
+                    "description": "Order confirmed by MIU",
+                }
+            ]
 
         return {
             **listing,
             "incoterm": await OrderService._order_incoterm(db, order),
             "buyerLabel": buyer_label,
-            "timeline": [
-                {"date": a.occurred_at.date().isoformat(), "description": a.description} for a in activity
-            ],
-            "milestones": [
-                {"id": m.step_key, "label": m.label, "state": milestone_state_map.get(m.state, "upcoming")}
-                for m in milestones
-            ],
+            "timeline": timeline,
+            "milestones": milestone_items,
             "milestoneProgress": round((pipeline_index / (len(ORDER_PIPELINE) - 1)) * 100),
             "milestoneCaption": (
                 "Click Update to mark production complete once goods are ready to dispatch."

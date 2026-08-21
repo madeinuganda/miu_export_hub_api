@@ -166,10 +166,17 @@ class VerificationDocumentItem(BaseModel):
     status: str
     required: bool = True
     has_file: bool = False
+    document_id: UUID | None = None
     file_id: UUID | None = None
     filename: str | None = None
     mime_type: str | None = None
     file_url: str | None = None
+
+
+class VerificationDocumentsBulkBody(BaseModel):
+    action: str  # approve | flag
+    document_ids: list[UUID]
+    message: str | None = None
 
 
 class VerificationApplicationItem(BaseModel):

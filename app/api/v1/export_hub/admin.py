@@ -37,6 +37,7 @@ from app.schemas.export_hub.admin import (
     BuyerAdminListResponse,
     VerificationApplicationsResponse,
     VerificationApplicationItem,
+    VerificationDocumentsBulkBody,
     VerificationRequestInfoBody,
     VerifyRequest,
 )
@@ -345,6 +346,23 @@ async def flag_verification_document(
 ):
     body = data or VerificationRequestInfoBody()
     return await AdminService.flag_verification_document(db, admin, doc_id, body.message)
+
+
+@router.post("/verification/applications/{application_id}/documents/bulk")
+async def bulk_update_verification_documents(
+    application_id: UUID,
+    data: VerificationDocumentsBulkBody,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await AdminService.bulk_update_verification_documents(
+        db,
+        admin,
+        application_id,
+        action=data.action,
+        document_ids=data.document_ids,
+        message=data.message,
+    )
 
 
 @router.delete("/verification/documents/{doc_id}")

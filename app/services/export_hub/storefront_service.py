@@ -33,7 +33,7 @@ from app.schemas.export_hub.storefront import (
     StorefrontStatItem,
     StorefrontUpdate,
 )
-from app.services.shared.file_storage import public_file_url, store_upload_bytes
+from app.services.shared.file_storage import as_public_file_url, public_file_url, store_upload_bytes
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
 from app.utils.formatting import format_ugx
 
@@ -51,7 +51,8 @@ class StorefrontService:
 
     @staticmethod
     def _public_url(org: SupplierOrganization) -> str:
-        return f"miu.ug/s/{org.slug}"
+        """Path suffix only — clients prepend their frontend base URL."""
+        return f"/s/{org.slug}"
 
     @staticmethod
     def _cert_tone(status: CertificationStatus) -> str:
@@ -213,7 +214,7 @@ class StorefrontService:
         return [
             StorefrontGalleryItem(
                 id=row.id,
-                imageUrl=row.image_url,
+                imageUrl=as_public_file_url(row.image_url) or row.image_url,
                 caption=row.caption,
                 sortOrder=row.sort_order,
             )
@@ -241,9 +242,9 @@ class StorefrontService:
             location=StorefrontService._format_location(org),
             website=org.website,
             about=org.short_description or org.brand_story,
-            bannerUrl=org.banner_url,
+            bannerUrl=as_public_file_url(org.banner_url) or org.banner_url,
             bannerStyle=org.banner_style or "miu-brand",
-            logoUrl=org.logo_url,
+            logoUrl=as_public_file_url(org.logo_url) or org.logo_url,
             companyDetails=company_details,
             stats=await StorefrontService._stats(db, org.id),
             featuredProducts=await StorefrontService._featured_products(db, org.id),
@@ -416,7 +417,7 @@ class StorefrontService:
         await db.refresh(photo)
         return StorefrontGalleryItem(
             id=photo.id,
-            imageUrl=photo.image_url,
+            imageUrl=as_public_file_url(photo.image_url) or photo.image_url,
             caption=photo.caption,
             sortOrder=photo.sort_order,
         )
@@ -442,7 +443,7 @@ class StorefrontService:
         await db.refresh(photo)
         return StorefrontGalleryItem(
             id=photo.id,
-            imageUrl=photo.image_url,
+            imageUrl=as_public_file_url(photo.image_url) or photo.image_url,
             caption=photo.caption,
             sortOrder=photo.sort_order,
         )

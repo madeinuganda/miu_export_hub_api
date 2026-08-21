@@ -33,6 +33,12 @@ class Rfq(AuditMixin, Base):
     status: Mapped[RfqStatus] = mapped_column(Enum(RfqStatus, name="rfq_status"), nullable=False)
     sample_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    supplier_messages_read_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    buyer_messages_read_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class RfqQuote(AuditMixin, Base):

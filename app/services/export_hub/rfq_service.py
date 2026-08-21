@@ -8,11 +8,19 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.shared.config import get_settings
 from app.core.shared.exceptions import AppError
+from app.models.export_hub.accounts import BuyerAccount, SupplierAccount
 from app.models.export_hub.catalog import Product
 from app.models.shared.enums import MessageReviewStatus, ProductStatus, QuoteStatus, RfqStatus, SenderRole
-from app.models.export_hub.organizations import BuyerOrganization, SupplierOrganization
+from app.models.export_hub.organizations import (
+    BuyerOrganization,
+    BuyerOrganizationMember,
+    SupplierOrganization,
+    SupplierOrganizationMember,
+)
 from app.models.export_hub.rfqs import Rfq, RfqMessage, RfqQuote
+from app.services.shared.email_service import EmailService
 from app.utils.audit import apply_create_audit, apply_update_audit
 from app.utils.formatting import format_quantity, format_relative_time, format_ugx
 
@@ -91,6 +99,7 @@ class RfqService:
         await db.flush()
         if data.message and data.message.strip():
             await RfqService.add_message(db, rfq.id, SenderRole.BUYER, data.message.strip(), user_id)
+        await RfqService.notify_supplier_new_rfq(db, rfq)
         return rfq
 
     @staticmethod
@@ -198,7 +207,83 @@ class RfqService:
         db.add(quote)
         rfq.status = RfqStatus.RESPONDED
         apply_update_audit(rfq, user_id)
+        await db.flush()
+        await RfqService.notify_buyer_quote_received(db, rfq, quote)
         return {"status": "quote_sent"}
+
+    @staticmethod
+    async def _primary_supplier_account(db: AsyncSession, org_id: UUID) -> SupplierAccount | None:
+        member = (
+            await db.execute(
+                select(SupplierOrganizationMember)
+                .where(
+                    SupplierOrganizationMember.org_id == org_id,
+                    SupplierOrganizationMember.deleted_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if not member:
+            return None
+        return await db.get(SupplierAccount, member.supplier_account_id)
+
+    @staticmethod
+    async def _primary_buyer_account(db: AsyncSession, org_id: UUID) -> BuyerAccount | None:
+        member = (
+            await db.execute(
+                select(BuyerOrganizationMember)
+                .where(
+                    BuyerOrganizationMember.org_id == org_id,
+                    BuyerOrganizationMember.deleted_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if not member:
+            return None
+        return await db.get(BuyerAccount, member.buyer_account_id)
+
+    @staticmethod
+    async def notify_supplier_new_rfq(
+        db: AsyncSession,
+        rfq: Rfq,
+        *,
+        note: str | None = None,
+    ) -> None:
+        account = await RfqService._primary_supplier_account(db, rfq.supplier_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, rfq.product_id)
+        product_name = product.name if product else "Product"
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_supplier_new_rfq_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            rfq_public_id=rfq.public_id,
+            product_name=product_name,
+            quantity_label=format_quantity(rfq.quantity, rfq.unit),
+            destination=rfq.destination_port,
+            note=note,
+            rfq_url=f"{base}/dashboard/supplier/rfq?id={rfq.public_id}",
+        )
+
+    @staticmethod
+    async def notify_buyer_quote_received(db: AsyncSession, rfq: Rfq, quote: RfqQuote) -> None:
+        account = await RfqService._primary_buyer_account(db, rfq.buyer_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, rfq.product_id)
+        product_name = product.name if product else "Product"
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_buyer_quote_received_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            rfq_public_id=rfq.public_id,
+            product_name=product_name,
+            offered_price=format_ugx(quote.unit_price, rfq.unit),
+            notes=quote.notes,
+            rfq_url=f"{base}/dashboard/buyer/rfqs?id={rfq.public_id}",
+        )
 
     @staticmethod
     async def add_message(
@@ -264,8 +349,11 @@ class RfqService:
         """Messages visible to a buyer or supplier viewer: their own messages
         (any review status, so they can see 'pending review' / 'reverted'
         badges on what they sent), plus routed admin/system messages, plus
-        the other party's messages only once routed by an admin."""
-        other_role = OTHER_PARTY_ROLE[viewer_role]
+        the other party's messages only once routed by an admin.
+
+        Opening the thread marks it read for the viewer so nav message badges
+        clear immediately until a newer inbound message arrives.
+        """
         rows = await RfqService._rfq_messages(db, rfq_id)
         visible = []
         for m in rows:
@@ -273,6 +361,15 @@ class RfqService:
                 visible.append(m)
             elif m.review_status == MessageReviewStatus.ROUTED:
                 visible.append(m)
+
+        rfq = await db.get(Rfq, rfq_id)
+        if rfq and not rfq.deleted_at:
+            now = datetime.now(timezone.utc)
+            if viewer_role == SenderRole.SUPPLIER:
+                rfq.supplier_messages_read_at = now
+            elif viewer_role == SenderRole.BUYER:
+                rfq.buyer_messages_read_at = now
+
         return [RfqService._serialize_message(m, admin_view=False) for m in visible]
 
     @staticmethod

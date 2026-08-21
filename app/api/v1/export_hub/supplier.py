@@ -22,7 +22,7 @@ from app.models.export_hub.misc import (
 )
 from app.services.shared.file_storage import store_upload_file, public_file_url
 from app.models.export_hub.accounts import SupplierNotification
-from app.models.export_hub.organizations import SupplierOrganization
+from app.models.export_hub.organizations import SupplierGalleryPhoto, SupplierOrganization
 from app.models.export_hub.orders import Order
 from app.models.export_hub.accounts import SupplierAccount, SupplierSession
 from app.services.export_hub.admin_service import AdminService
@@ -42,7 +42,10 @@ from app.schemas.export_hub.storefront import (
     StorefrontResponse,
     StorefrontUpdate,
 )
-from app.utils.audit import apply_create_audit, apply_update_audit
+from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
+
+SITE_PHOTOS_MAX = 8
+SITE_PHOTO_TYPES = {"sitePhotos", "production"}
 
 router = APIRouter(prefix="/supplier")
 
@@ -95,8 +98,9 @@ async def supplier_profile(
     payload = _supplier_profile_payload(org, account)
     effective = await AdminService.effective_verification_status(db, org)
     payload["verificationStatus"] = effective
-    if effective == "action_required":
-        payload["actionRequired"] = await AdminService.get_action_required_summary(db, org.id)
+    summary = await AdminService.get_action_required_summary(db, org.id)
+    if effective == "action_required" or summary.get("attentionItems"):
+        payload["actionRequired"] = summary
     return payload
 
 
@@ -178,37 +182,97 @@ async def onboarding_documents(
     account: SupplierAccount = Depends(require_supplier_password_changed),
     org: SupplierOrganization = Depends(get_supplier_org),
 ):
+    is_site_photo = document_type in SITE_PHOTO_TYPES
+
+    if is_site_photo:
+        existing_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(RegistrationDocument)
+                .where(
+                    RegistrationDocument.org_id == org.id,
+                    RegistrationDocument.document_type.in_(SITE_PHOTO_TYPES),
+                    RegistrationDocument.deleted_at.is_(None),
+                )
+            )
+        ).scalar() or 0
+        if existing_count >= SITE_PHOTOS_MAX:
+            raise AppError(
+                400,
+                f"You can upload up to {SITE_PHOTOS_MAX} production site photos.",
+                "site_photos_limit",
+            )
+
     record = await store_upload_file(
         db,
         file=file,
         uploaded_by=account.id,
         subdirectory=f"supplier/{org.id}/registration",
     )
+    file_url = public_file_url(record.storage_key)
 
-    existing = (
-        await db.execute(
-            select(RegistrationDocument).where(
-                RegistrationDocument.org_id == org.id,
-                RegistrationDocument.document_type == document_type,
-                RegistrationDocument.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-
-    if existing:
-        existing.file_id = record.id
-        existing.status = DocumentStatus.PENDING
-        apply_update_audit(existing, account.id)
-    else:
+    doc: RegistrationDocument | None = None
+    if is_site_photo:
         doc = RegistrationDocument(
             org_id=org.id,
-            document_type=document_type,
+            document_type="sitePhotos",
             file_id=record.id,
-            required=document_type in ("businessRegistration", "tin"),
+            required=False,
             status=DocumentStatus.PENDING,
         )
         apply_create_audit(doc, account.id)
         db.add(doc)
+        await db.flush()
+    else:
+        existing = (
+            await db.execute(
+                select(RegistrationDocument).where(
+                    RegistrationDocument.org_id == org.id,
+                    RegistrationDocument.document_type == document_type,
+                    RegistrationDocument.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+
+        if existing:
+            existing.file_id = record.id
+            existing.status = DocumentStatus.PENDING
+            apply_update_audit(existing, account.id)
+            doc = existing
+        else:
+            doc = RegistrationDocument(
+                org_id=org.id,
+                document_type=document_type,
+                file_id=record.id,
+                required=document_type in ("businessRegistration", "tin"),
+                status=DocumentStatus.PENDING,
+            )
+            apply_create_audit(doc, account.id)
+            db.add(doc)
+            await db.flush()
+
+    gallery_photo_id: str | None = None
+    if is_site_photo:
+        gallery_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(SupplierGalleryPhoto)
+                .where(
+                    SupplierGalleryPhoto.org_id == org.id,
+                    SupplierGalleryPhoto.deleted_at.is_(None),
+                )
+            )
+        ).scalar() or 0
+        photo = SupplierGalleryPhoto(
+            org_id=org.id,
+            image_url=file_url,
+            caption=file.filename,
+            sort_order=int(gallery_count),
+        )
+        apply_create_audit(photo, account.id)
+        db.add(photo)
+        await db.flush()
+        gallery_photo_id = str(photo.id)
 
     draft = (
         await db.execute(
@@ -230,21 +294,126 @@ async def onboarding_documents(
 
     payload = dict(draft.payload or {})
     documents = dict(payload.get("documents") or {})
-    documents[document_type] = {
-        "uploaded": True,
+    file_entry = {
         "filename": file.filename,
         "fileId": str(record.id),
+        "documentId": str(doc.id) if doc else None,
+        "url": file_url,
+        "galleryPhotoId": gallery_photo_id,
     }
+    if is_site_photo:
+        existing_entry = documents.get("sitePhotos")
+        files: list = []
+        if isinstance(existing_entry, dict):
+            raw_files = existing_entry.get("files")
+            if isinstance(raw_files, list):
+                files = list(raw_files)
+            elif existing_entry.get("fileId"):
+                files = [
+                    {
+                        "filename": existing_entry.get("filename"),
+                        "fileId": existing_entry.get("fileId"),
+                        "documentId": existing_entry.get("documentId"),
+                        "url": existing_entry.get("url"),
+                        "galleryPhotoId": existing_entry.get("galleryPhotoId"),
+                    }
+                ]
+        files.append(file_entry)
+        documents["sitePhotos"] = {
+            "uploaded": True,
+            "filename": file.filename,
+            "fileId": str(record.id),
+            "files": files,
+        }
+    else:
+        documents[document_type] = {
+            "uploaded": True,
+            "filename": file.filename,
+            "fileId": str(record.id),
+        }
     payload["documents"] = documents
     draft.payload = payload
 
     await _sync_registration_documents_from_draft(db, org, account.id)
 
     return {
-        "documentType": document_type,
+        "documentType": document_type if not is_site_photo else "sitePhotos",
         "filename": file.filename,
         "fileId": str(record.id),
+        "documentId": str(doc.id) if doc else None,
+        "url": file_url,
+        "galleryPhotoId": gallery_photo_id,
+        "files": documents.get("sitePhotos", {}).get("files") if is_site_photo else None,
     }
+
+
+@router.delete("/onboarding/documents/{document_id}")
+async def delete_onboarding_document(
+    document_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+    org: SupplierOrganization = Depends(get_supplier_org),
+):
+    doc = await db.get(RegistrationDocument, document_id)
+    if not doc or doc.deleted_at or doc.org_id != org.id:
+        raise AppError(404, "Document not found", "not_found")
+
+    soft_delete(doc, account.id)
+
+    draft = (
+        await db.execute(
+            select(SupplierRegistrationDraft).where(
+                SupplierRegistrationDraft.supplier_account_id == account.id,
+                SupplierRegistrationDraft.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if draft and draft.payload:
+        payload = dict(draft.payload)
+        documents = dict(payload.get("documents") or {})
+        entry = documents.get(doc.document_type)
+        if isinstance(entry, dict):
+            files = entry.get("files")
+            if isinstance(files, list):
+                remaining = [
+                    f
+                    for f in files
+                    if str(f.get("documentId") or "") != str(document_id)
+                    and str(f.get("fileId") or "") != str(doc.file_id or "")
+                ]
+                if remaining:
+                    last = remaining[-1]
+                    documents[doc.document_type] = {
+                        "uploaded": True,
+                        "filename": last.get("filename"),
+                        "fileId": last.get("fileId"),
+                        "files": remaining,
+                    }
+                else:
+                    documents[doc.document_type] = {"uploaded": False}
+            elif str(entry.get("fileId") or "") == str(doc.file_id or ""):
+                documents[doc.document_type] = {"uploaded": False}
+            payload["documents"] = documents
+            draft.payload = payload
+
+    if doc.document_type in SITE_PHOTO_TYPES and doc.file_id:
+        record = await db.get(FileRecord, doc.file_id)
+        if record and not record.deleted_at:
+            url = public_file_url(record.storage_key)
+            legacy_url = f"/uploads/{record.storage_key.lstrip('/')}"
+            photos = (
+                await db.execute(
+                    select(SupplierGalleryPhoto).where(
+                        SupplierGalleryPhoto.org_id == org.id,
+                        SupplierGalleryPhoto.image_url.in_([url, legacy_url]),
+                        SupplierGalleryPhoto.deleted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+            for photo in photos:
+                soft_delete(photo, account.id)
+
+    return {"ok": True}
 
 
 async def _sync_registration_documents_from_draft(
@@ -271,33 +440,64 @@ async def _sync_registration_documents_from_draft(
     for document_type, entry in documents.items():
         if not isinstance(entry, dict):
             continue
-        raw_fid = entry.get("fileId") or entry.get("file_id")
-        if not raw_fid:
-            continue
-        try:
-            file_id = UUID(str(raw_fid))
-        except ValueError:
-            continue
 
-        record = await db.get(FileRecord, file_id)
-        if not record or record.deleted_at:
-            continue
-
-        existing = (
-            await db.execute(
-                select(RegistrationDocument).where(
-                    RegistrationDocument.org_id == org.id,
-                    RegistrationDocument.document_type == document_type,
-                    RegistrationDocument.deleted_at.is_(None),
-                )
-            )
-        ).scalar_one_or_none()
-
-        if existing:
-            existing.file_id = file_id
-            existing.status = DocumentStatus.PENDING
-            apply_update_audit(existing, account_id)
+        file_ids: list[UUID] = []
+        raw_files = entry.get("files")
+        if isinstance(raw_files, list):
+            for item in raw_files:
+                if not isinstance(item, dict):
+                    continue
+                raw_fid = item.get("fileId") or item.get("file_id")
+                if not raw_fid:
+                    continue
+                try:
+                    file_ids.append(UUID(str(raw_fid)))
+                except ValueError:
+                    continue
         else:
+            raw_fid = entry.get("fileId") or entry.get("file_id")
+            if raw_fid:
+                try:
+                    file_ids.append(UUID(str(raw_fid)))
+                except ValueError:
+                    pass
+
+        for file_id in file_ids:
+            record = await db.get(FileRecord, file_id)
+            if not record or record.deleted_at:
+                continue
+
+            existing = (
+                await db.execute(
+                    select(RegistrationDocument).where(
+                        RegistrationDocument.org_id == org.id,
+                        RegistrationDocument.document_type == document_type,
+                        RegistrationDocument.file_id == file_id,
+                        RegistrationDocument.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if existing:
+                continue
+
+            if document_type not in SITE_PHOTO_TYPES:
+                # Single-file docs: replace-in-place by type when no matching file row.
+                by_type = (
+                    await db.execute(
+                        select(RegistrationDocument).where(
+                            RegistrationDocument.org_id == org.id,
+                            RegistrationDocument.document_type == document_type,
+                            RegistrationDocument.deleted_at.is_(None),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if by_type:
+                    by_type.file_id = file_id
+                    by_type.status = DocumentStatus.PENDING
+                    apply_update_audit(by_type, account_id)
+                    continue
+
             doc = RegistrationDocument(
                 org_id=org.id,
                 document_type=document_type,
@@ -315,9 +515,19 @@ async def onboarding_submit(
     org: SupplierOrganization = Depends(get_supplier_org),
     account: SupplierAccount = Depends(require_supplier_password_changed),
 ):
+    from app.services.shared.email_service import EmailService
+
     await _sync_registration_documents_from_draft(db, org, account.id)
+    await AdminService._ensure_contact_document(db, org.id, account.id)
     org.verification_status = VerificationStatus.PENDING
     apply_update_audit(org, account.id)
+
+    if account.email:
+        await EmailService.send_supplier_onboarding_submitted_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            company_name=org.name,
+        )
     return {"status": "pending"}
 
 
@@ -559,6 +769,13 @@ async def orders_summary(db: AsyncSession = Depends(get_db), org: SupplierOrgani
         await db.execute(select(Order).where(Order.supplier_org_id == org.id, Order.deleted_at.is_(None)))
     ).scalars().all()
     stage_ids = [PIPELINE_STAGE_IDS[OrderService.order_pipeline_index(o)] for o in orders]
+    coarse = [OrderService._coarse_supplier_status(s) for s in stage_ids]
+    status_counts = {
+        "payment_secured": sum(1 for s in coarse if s == "payment_secured"),
+        "in_production": sum(1 for s in coarse if s == "in_production"),
+        "shipped": sum(1 for s in coarse if s == "shipped"),
+        "fulfilled": sum(1 for s in coarse if s == "fulfilled"),
+    }
     in_production = sum(1 for s in stage_ids if s == "in_production")
     awaiting_shipment = sum(1 for s in stage_ids if s == "ready_to_dispatch")
     active_orders = [o for i, o in enumerate(orders) if stage_ids[i] != "fulfilled"]
@@ -568,6 +785,7 @@ async def orders_summary(db: AsyncSession = Depends(get_db), org: SupplierOrgani
         "active": len(active_orders),
         "pipeline": pipeline,
         "pipelineValueDisplay": format_ugx(pipeline_value),
+        "statusCounts": status_counts,
     }
 
 
@@ -757,7 +975,12 @@ async def checklist_readiness(db: AsyncSession = Depends(get_db), org: SupplierO
 
 
 @router.get("/company-profile")
-async def company_profile(org: SupplierOrganization = Depends(get_supplier_org)):
+async def company_profile(
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    storefront = await StorefrontService.get_storefront(db, org)
     return {
         "name": org.name,
         "tagline": org.tagline,
@@ -767,6 +990,24 @@ async def company_profile(org: SupplierOrganization = Depends(get_supplier_org))
         "category": org.category,
         "region": org.region,
         "district": org.district,
+        "location": storefront.location,
+        "verified": storefront.verified,
+        "verificationStatus": org.verification_status.value,
+        "bannerUrl": storefront.bannerUrl,
+        "bannerStyle": storefront.bannerStyle,
+        "logoUrl": storefront.logoUrl,
+        "slug": storefront.slug,
+        "publicUrl": storefront.publicUrl,
+        "gallery": [item.model_dump(mode="json") for item in storefront.gallery],
+        "certifications": [item.model_dump(mode="json") for item in storefront.certifications],
+        "stats": [item.model_dump(mode="json") for item in storefront.stats],
+        "contact": {
+            "phone": account.phone,
+            "email": account.email,
+            "website": org.website,
+            "address": storefront.location,
+        },
+        "galleryMax": SITE_PHOTOS_MAX,
     }
 
 
@@ -869,6 +1110,62 @@ async def create_storefront_gallery_photo(
     account: SupplierAccount = Depends(require_supplier_password_changed),
 ):
     return await StorefrontService.create_gallery_photo(db, org, account, data)
+
+
+@router.post("/storefront/gallery/upload", response_model=StorefrontGalleryItem)
+async def upload_storefront_gallery_photo(
+    file: UploadFile = File(...),
+    caption: str | None = Form(None),
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    gallery_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(SupplierGalleryPhoto)
+            .where(
+                SupplierGalleryPhoto.org_id == org.id,
+                SupplierGalleryPhoto.deleted_at.is_(None),
+            )
+        )
+    ).scalar() or 0
+    if gallery_count >= SITE_PHOTOS_MAX:
+        raise AppError(
+            400,
+            f"You can upload up to {SITE_PHOTOS_MAX} production site photos.",
+            "site_photos_limit",
+        )
+
+    record = await store_upload_file(
+        db,
+        file=file,
+        uploaded_by=account.id,
+        subdirectory=f"storefront/{org.id}/gallery",
+    )
+    file_url = public_file_url(record.storage_key)
+
+    # Keep registration site-photo records in sync so admin verification sees them.
+    doc = RegistrationDocument(
+        org_id=org.id,
+        document_type="sitePhotos",
+        file_id=record.id,
+        required=False,
+        status=DocumentStatus.PENDING,
+    )
+    apply_create_audit(doc, account.id)
+    db.add(doc)
+
+    return await StorefrontService.create_gallery_photo(
+        db,
+        org,
+        account,
+        GalleryPhotoCreate(
+            imageUrl=file_url,
+            caption=caption or file.filename,
+            sortOrder=int(gallery_count),
+        ),
+    )
 
 
 @router.patch("/storefront/gallery/{photo_id}", response_model=StorefrontGalleryItem)

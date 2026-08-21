@@ -16,7 +16,7 @@ from app.models.export_hub.payments import PaymentEscrow, PaymentLink, PaymentMi
 from app.models.export_hub.rfqs import Rfq, RfqQuote
 from app.services.export_hub.rfq_service import RfqService
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
-from app.utils.formatting import format_quantity, format_ugx
+from app.utils.formatting import format_money, format_quantity
 
 
 def _format_display_date(value: datetime | None) -> str:
@@ -68,13 +68,30 @@ class OrderService:
     @staticmethod
     async def accept_rfq(db: AsyncSession, buyer_org_id: UUID, user_id: UUID, public_id: str) -> dict:
         rfq = (
-            await db.execute(select(Rfq).where(Rfq.public_id == public_id, Rfq.buyer_org_id == buyer_org_id, Rfq.deleted_at.is_(None)))
+            await db.execute(
+                select(Rfq)
+                .where(
+                    Rfq.public_id == public_id,
+                    Rfq.buyer_org_id == buyer_org_id,
+                    Rfq.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
         ).scalar_one_or_none()
         if not rfq:
             raise AppError(404, "RFQ not found", "not_found")
+        if rfq.status not in (RfqStatus.RESPONDED, RfqStatus.AWAITING):
+            raise AppError(400, "RFQ cannot be accepted in its current status", "invalid_status")
         quote = (
             await db.execute(
-                select(RfqQuote).where(RfqQuote.rfq_id == rfq.id, RfqQuote.status == QuoteStatus.SENT.value, RfqQuote.deleted_at.is_(None)).limit(1)
+                select(RfqQuote)
+                .where(
+                    RfqQuote.rfq_id == rfq.id,
+                    RfqQuote.status == QuoteStatus.SENT.value,
+                    RfqQuote.deleted_at.is_(None),
+                )
+                .limit(1)
+                .with_for_update()
             )
         ).scalar_one_or_none()
         if not quote:
@@ -159,13 +176,12 @@ class OrderService:
         apply_update_audit(rfq, user_id)
         apply_update_audit(quote, user_id)
         from app.services.export_hub.rfq_service import RfqService
-        from app.utils.formatting import format_ugx
 
         await RfqService.notify_supplier_quote_accepted(
             db,
             rfq,
             order_public_id=order.public_id,
-            offered_price=format_ugx(quote.unit_price, rfq.unit),
+            offered_price=format_money(quote.unit_price, quote.currency, rfq.unit),
         )
         return {"orderId": order.public_id, "paymentLinkToken": token}
 
@@ -196,7 +212,7 @@ class OrderService:
             "productName": product.name if product else "",
             "supplierName": supplier.name if supplier else "",
             "quantity": format_quantity(order.quantity, order.unit),
-            "totalValue": format_ugx(order.total_value_amount),
+            "totalValue": format_money(order.total_value_amount, order.currency),
             "tab": tab,
             "progressLabel": current.label if current else "",
             "progressFilled": filled,
@@ -247,7 +263,9 @@ class OrderService:
             paid_percent = 100
         return {
             **listing,
-            "paidAmount": format_ugx(upfront),
+            "paidAmount": format_money(
+                upfront, (escrow.currency if escrow else None) or order.currency
+            ),
             "paidPercentLabel": f"{paid_percent}% paid",
             "eta": tracking.eta_date.isoformat() if tracking and tracking.eta_date else "",
             "trackingNumber": tracking.tracking_number if tracking else None,
@@ -350,7 +368,7 @@ class OrderService:
         if pipeline_index >= PIPELINE_BY_STAGE["delivered"][0]:
             return "Fully paid", "positive"
         if pipeline_index >= PIPELINE_BY_STAGE["in_production"][0]:
-            return f"{format_ugx(escrow.balance_amount)} due", "muted"
+            return f"{format_money(escrow.balance_amount, escrow.currency or order.currency)} due", "muted"
         return "Escrow secured", "muted"
 
     @staticmethod
@@ -365,7 +383,7 @@ class OrderService:
             "country": (buyer.country if buyer and buyer.country else "") or "N/A",
             "product": product.name if product else "N/A",
             "quantity": format_quantity(order.quantity, order.unit),
-            "value": format_ugx(order.total_value_amount),
+            "value": format_money(order.total_value_amount, order.currency),
             "paymentNote": payment_note,
             "paymentTone": payment_tone,
             "status": OrderService._coarse_supplier_status(PIPELINE_STAGE_IDS[pipeline_index]),
@@ -460,10 +478,11 @@ class OrderService:
         if escrow:
             upfront_secured = escrow.status != EscrowStatus.PENDING
             balance_released = escrow.status == EscrowStatus.BALANCE_RELEASED
+            currency = escrow.currency or order.currency
             escrow_legs.append(
                 {
                     "label": f"{escrow.upfront_percent}% upfront (escrow)",
-                    "amount": format_ugx(escrow.upfront_amount),
+                    "amount": format_money(escrow.upfront_amount, currency),
                     "note": _format_display_date(order.created_at) if upfront_secured else "Awaiting payment",
                     "secured": upfront_secured,
                 }
@@ -471,22 +490,23 @@ class OrderService:
             escrow_legs.append(
                 {
                     "label": f"{100 - escrow.upfront_percent}% on delivery",
-                    "amount": format_ugx(escrow.balance_amount),
+                    "amount": format_money(escrow.balance_amount, currency),
                     "note": "Released on delivery confirmation" if balance_released else "Due on delivery",
                     "secured": balance_released,
                 }
             )
         else:
+            currency = order.currency
             escrow_legs = [
                 {
                     "label": "70% upfront (escrow)",
-                    "amount": format_ugx(order.total_value_amount * Decimal("0.7")),
+                    "amount": format_money(order.total_value_amount * Decimal("0.7"), currency),
                     "note": "Awaiting payment setup",
                     "secured": False,
                 },
                 {
                     "label": "30% on delivery",
-                    "amount": format_ugx(order.total_value_amount * Decimal("0.3")),
+                    "amount": format_money(order.total_value_amount * Decimal("0.3"), currency),
                     "note": "Due on delivery",
                     "secured": False,
                 },

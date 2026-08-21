@@ -22,7 +22,7 @@ from app.models.export_hub.organizations import (
 from app.models.export_hub.rfqs import Rfq, RfqMessage, RfqQuote
 from app.services.shared.email_service import EmailService
 from app.utils.audit import apply_create_audit, apply_update_audit
-from app.utils.formatting import format_quantity, format_relative_time, format_ugx
+from app.utils.formatting import format_quantity, format_relative_time, format_money, format_ugx
 
 OTHER_PARTY_ROLE = {
     SenderRole.BUYER: SenderRole.SUPPLIER,
@@ -341,11 +341,13 @@ class RfqService:
     ) -> dict:
         rfq = (
             await db.execute(
-                select(Rfq).where(
+                select(Rfq)
+                .where(
                     Rfq.public_id == public_id,
                     Rfq.buyer_org_id == buyer_org_id,
                     Rfq.deleted_at.is_(None),
                 )
+                .with_for_update()
             )
         ).scalar_one_or_none()
         if not rfq:
@@ -359,12 +361,25 @@ class RfqService:
                 .where(RfqQuote.rfq_id == rfq.id, RfqQuote.deleted_at.is_(None))
                 .order_by(RfqQuote.created_at.desc())
                 .limit(1)
+                .with_for_update()
             )
         ).scalar_one_or_none()
-        offered_price = format_ugx(quote.unit_price, rfq.unit) if quote else None
-        if quote and quote.status == QuoteStatus.SENT:
-            quote.status = QuoteStatus.DECLINED
-            apply_update_audit(quote, user_id)
+
+        # Quote-declined emails only apply when a quote exists. AWAITING without a
+        # quote is a buyer withdrawal — update status only, no quote notification.
+        if rfq.status == RfqStatus.AWAITING and quote is None:
+            rfq.status = RfqStatus.DECLINED
+            apply_update_audit(rfq, user_id)
+            return {"ok": True}
+
+        if quote is None:
+            raise AppError(400, "No quote to decline", "no_quote")
+        if quote.status != QuoteStatus.SENT:
+            raise AppError(400, "Quote cannot be declined in its current status", "invalid_status")
+
+        offered_price = format_money(quote.unit_price, quote.currency, rfq.unit)
+        quote.status = QuoteStatus.DECLINED
+        apply_update_audit(quote, user_id)
 
         rfq.status = RfqStatus.DECLINED
         apply_update_audit(rfq, user_id)

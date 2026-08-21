@@ -32,8 +32,35 @@ def format_relative_time(value: datetime | None) -> str:
 
 
 def format_ugx(amount: Decimal | float | int, per_unit: str | None = None) -> str:
-    value = int(Decimal(str(amount)))
-    formatted = f"UGX {value:,}"
+    return format_money(amount, "UGX", per_unit)
+
+
+# ISO 4217 currencies that do not use minor units in common trade display.
+_ZERO_DECIMAL_CURRENCIES = frozenset(
+    {
+        "UGX",
+        "JPY",
+        "KRW",
+        "VND",
+        "CLP",
+        "XAF",
+        "XOF",
+    }
+)
+
+
+def format_money(
+    amount: Decimal | float | int,
+    currency: str | None = "UGX",
+    per_unit: str | None = None,
+) -> str:
+    code = (currency or "UGX").strip().upper() or "UGX"
+    amount_dec = Decimal(str(amount))
+    if code in _ZERO_DECIMAL_CURRENCIES:
+        formatted = f"{code} {int(amount_dec):,}"
+    else:
+        quantized = amount_dec.quantize(Decimal("0.01"))
+        formatted = f"{code} {quantized:,.2f}"
     if per_unit:
         return f"{formatted}/{per_unit}"
     return formatted

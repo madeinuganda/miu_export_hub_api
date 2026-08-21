@@ -82,13 +82,13 @@ uploads_path.mkdir(parents=True, exist_ok=True)
 
 def _resolve_upload_file(file_path: str) -> Path | None:
     """Resolve a stored upload path, blocking directory traversal."""
-    candidate = (uploads_path / file_path).resolve()
-    root = uploads_path.resolve()
     try:
+        candidate = (uploads_path / file_path).resolve()
+        root = uploads_path.resolve()
         candidate.relative_to(root)
-    except ValueError:
-        return None
-    if not candidate.is_file():
+        if not candidate.is_file():
+            return None
+    except (OSError, RuntimeError, ValueError):
         return None
     return candidate
 

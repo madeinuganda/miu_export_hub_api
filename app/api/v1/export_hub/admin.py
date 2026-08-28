@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,9 +23,13 @@ from app.schemas.export_hub.admin import (
     AdminMessageRouteRequest,
     AdminNotificationsSummary,
     AdminOrderListResponse,
+    AdminPaymentProofItem,
+    AdminPaymentProofListResponse,
+    AdminPaymentProofRequest,
     AdminProductFeaturedUpdate,
     AdminProductListItem,
     AdminProductListResponse,
+    AdminProductReviewRequest,
     AdminRfqListResponse,
     EscrowReleaseResponse,
     OrderAdvanceRequest,
@@ -32,6 +37,7 @@ from app.schemas.export_hub.admin import (
     OrderMilestoneUpdateResponse,
     OrderPipelineStepsResponse,
     RelayQuoteRequest,
+    ReturnQuoteRequest,
     RfqAssignRequest,
     BuyerAdminItem,
     BuyerAdminListResponse,
@@ -45,6 +51,8 @@ from app.schemas.export_hub.auth import AdminInviteRequest, AdminInviteResponse
 from app.services.export_hub.admin_auth_service import AdminAuthService
 from app.services.export_hub.admin_service import AdminService
 from app.services.export_hub.category_service import CategoryService
+from app.services.export_hub.document_endpoints import AdminDocuments
+from app.services.export_hub.payment_proof_service import PaymentProofService
 from app.services.export_hub.product_admin_service import ProductAdminService
 from app.services.export_hub.testimonial_service import TestimonialService
 from app.services.export_hub.browse_service import BrowseService
@@ -103,13 +111,39 @@ async def assign_rfq(
 
 
 @router.post("/rfqs/{public_id}/relay-quote")
+@router.post("/deals/{public_id}/relay-quote")
 async def relay_quote(
     public_id: str,
     data: RelayQuoteRequest,
     db: AsyncSession = Depends(get_db),
     admin: AdminAccount = Depends(require_admin_password_changed),
 ):
+    """Release a reviewed supplier quote to the buyer."""
     return await AdminService.relay_quote(db, admin, public_id, data)
+
+
+@router.post("/rfqs/{public_id}/return-quote")
+@router.post("/deals/{public_id}/return-quote")
+async def return_quote(
+    public_id: str,
+    data: ReturnQuoteRequest,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    """Send a quote back to the supplier for changes; the buyer never sees it."""
+    return await AdminService.return_quote(db, admin, public_id, data)
+
+
+@router.get("/rfqs/{public_id}/documents/{doc_kind}")
+@router.get("/deals/{public_id}/documents/{doc_kind}")
+async def download_rfq_document(
+    public_id: str,
+    doc_kind: str,
+    db: AsyncSession = Depends(get_db),
+    _: AdminAccount = Depends(require_admin_password_changed),
+):
+    """Generate an RFQ or quotation PDF. `doc_kind` is `rfq` or `quote`."""
+    return await AdminDocuments.rfq_document_response(db, public_id, doc_kind)
 
 
 @router.get("/rfqs/{public_id}/messages")
@@ -260,6 +294,97 @@ async def release_escrow(
     admin: AdminAccount = Depends(require_admin_password_changed),
 ):
     return await AdminService.release_escrow(db, admin, public_id)
+
+
+@router.get(
+    "/orders/{public_id}/payment-proofs", response_model=AdminPaymentProofListResponse
+)
+async def list_payment_proofs(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: AdminAccount = Depends(require_admin_password_changed),
+):
+    """Every proof of payment recorded against an order."""
+    return await PaymentProofService.list_proofs(db, public_id)
+
+
+@router.post("/orders/{public_id}/payment-proofs", response_model=AdminPaymentProofItem)
+async def add_payment_proof(
+    public_id: str,
+    payment_type: str = Form(...),
+    amount: Decimal = Form(...),
+    currency: str = Form("UGX"),
+    method: str | None = Form(None),
+    payment_reference: str | None = Form(None),
+    paid_at: str | None = Form(None),
+    note: str | None = Form(None),
+    send_attachment: bool = Form(True),
+    notify_buyer: bool = Form(True),
+    notify_supplier: bool = Form(True),
+    file: UploadFile | None = File(None),
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    """Record a payment. Attach a receipt file, or leave it out and MIU
+    generates one. `send_attachment` controls whether the document is emailed."""
+    data = AdminPaymentProofRequest(
+        payment_type=payment_type,
+        amount=amount,
+        currency=currency,
+        method=method,
+        payment_reference=payment_reference,
+        paid_at=paid_at,
+        note=note,
+        send_attachment=send_attachment,
+        notify_buyer=notify_buyer,
+        notify_supplier=notify_supplier,
+    )
+    return await PaymentProofService.create_proof(db, admin, public_id, data, file)
+
+
+@router.post(
+    "/orders/{public_id}/payment-proofs/{proof_id}/notify",
+    response_model=AdminPaymentProofItem,
+)
+async def resend_payment_proof(
+    public_id: str,
+    proof_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await PaymentProofService.resend(db, admin, public_id, proof_id)
+
+
+@router.delete("/orders/{public_id}/payment-proofs/{proof_id}")
+async def delete_payment_proof(
+    public_id: str,
+    proof_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    return await PaymentProofService.delete(db, admin, public_id, proof_id)
+
+
+@router.get("/orders/{public_id}/payment-proofs/{proof_id}/receipt")
+async def download_payment_receipt(
+    public_id: str,
+    proof_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    _: AdminAccount = Depends(require_admin_password_changed),
+):
+    """MIU-issued receipt PDF for a recorded payment."""
+    attachment = await PaymentProofService.receipt_pdf(db, public_id, proof_id)
+    return AdminDocuments.pdf_response(attachment)
+
+
+@router.get("/orders/{public_id}/documents/order")
+async def download_order_document(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: AdminAccount = Depends(require_admin_password_changed),
+):
+    """Order confirmation PDF."""
+    return await AdminDocuments.order_document_response(db, public_id)
 
 
 @router.get("/verification/applications", response_model=VerificationApplicationsResponse)
@@ -736,6 +861,17 @@ async def list_products(
         page=page,
         page_size=page_size,
     )
+
+
+@router.post("/products/{product_id}/review", response_model=AdminProductListItem)
+async def review_product(
+    product_id: UUID,
+    data: AdminProductReviewRequest,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminAccount = Depends(require_admin_password_changed),
+):
+    """Approve a pending listing (publishes it) or reject it with feedback."""
+    return await ProductAdminService.review_product(db, admin, product_id, data)
 
 
 @router.patch("/products/{product_id}/featured", response_model=AdminProductListItem)

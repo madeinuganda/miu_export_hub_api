@@ -54,6 +54,10 @@ class RfqQuote(AuditMixin, Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[QuoteStatus] = mapped_column(Enum(QuoteStatus, name="quote_status"), nullable=False)
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_by: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    admin_remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class RfqMessage(AuditMixin, Base):

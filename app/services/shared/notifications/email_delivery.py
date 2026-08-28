@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+from collections.abc import Sequence
 from email.message import EmailMessage
 
 import httpx
 
 from app.core.shared.config import get_settings
 from app.core.shared.exceptions import AppError
+from app.services.shared.notifications.email_templates import EmailAttachment
 
 logger = logging.getLogger(__name__)
 
@@ -27,25 +30,40 @@ class EmailDeliveryService:
         subject: str,
         body: str,
         html_body: str | None = None,
+        attachments: Sequence[EmailAttachment] | None = None,
     ) -> dict:
         settings = get_settings()
+        files = list(attachments or [])
         if settings.sendgrid_enabled and settings.sendgrid_api_key:
             return await EmailDeliveryService._send_sendgrid(
-                to=to, subject=subject, body=body, html_body=html_body
+                to=to, subject=subject, body=body, html_body=html_body, attachments=files
             )
         if settings.mail_enabled and settings.mail_host:
             return await EmailDeliveryService._send_smtp(
-                to=to, subject=subject, body=body, html_body=html_body
+                to=to, subject=subject, body=body, html_body=html_body, attachments=files
             )
         if settings.environment == "development":
-            logger.info("Email (dev) to=%s subject=%s\n%s", to, subject, body)
-            print(f"\n[MIU] Email to {to}\nSubject: {subject}\n{body}\n")
+            names = ", ".join(f.filename for f in files) or "none"
+            logger.info(
+                "Email (dev) to=%s subject=%s attachments=%s\n%s", to, subject, names, body
+            )
+            print(
+                f"\n[MIU] Email to {to}\nSubject: {subject}\n"
+                f"Attachments: {names}\n{body}\n"
+            )
             return {"mode": "dev_log", "to": to}
 
         raise AppError(503, "Email is not configured", "email_not_configured")
 
     @staticmethod
-    async def _send_smtp(*, to: str, subject: str, body: str, html_body: str | None) -> dict:
+    async def _send_smtp(
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        html_body: str | None,
+        attachments: Sequence[EmailAttachment] = (),
+    ) -> dict:
         settings = get_settings()
 
         def _deliver() -> None:
@@ -58,6 +76,15 @@ class EmailDeliveryService:
                 msg.add_alternative(html_body, subtype="html")
             else:
                 msg.set_content(body)
+
+            for item in attachments:
+                maintype, _, subtype = item.mime_type.partition("/")
+                msg.add_attachment(
+                    item.content,
+                    maintype=maintype or "application",
+                    subtype=subtype or "octet-stream",
+                    filename=item.filename,
+                )
 
             import smtplib
 
@@ -77,7 +104,14 @@ class EmailDeliveryService:
         return {"mode": "smtp", "to": to, "host": settings.mail_host}
 
     @staticmethod
-    async def _send_sendgrid(*, to: str, subject: str, body: str, html_body: str | None) -> dict:
+    async def _send_sendgrid(
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        html_body: str | None,
+        attachments: Sequence[EmailAttachment] = (),
+    ) -> dict:
         settings = get_settings()
         content = []
         if html_body:
@@ -86,12 +120,22 @@ class EmailDeliveryService:
         else:
             content.append({"type": "text/plain", "value": body})
 
-        payload = {
+        payload: dict = {
             "personalizations": [{"to": [{"email": to}]}],
             "from": {"email": settings.sendgrid_from_email, "name": settings.sendgrid_from_name},
             "subject": subject,
             "content": content,
         }
+        if attachments:
+            payload["attachments"] = [
+                {
+                    "content": base64.b64encode(item.content).decode("ascii"),
+                    "filename": item.filename,
+                    "type": item.mime_type,
+                    "disposition": "attachment",
+                }
+                for item in attachments
+            ]
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(

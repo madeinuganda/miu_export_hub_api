@@ -39,7 +39,14 @@ from app.models.export_hub.marketplace import (
     CmsNavLink,
 )
 from app.models.export_hub.rfqs import Rfq, RfqQuote, RfqMessage
-from app.models.export_hub.orders import Order, OrderMilestone, OrderActivity, OrderTracking, OrderDocument
+from app.models.export_hub.orders import (
+    Order,
+    OrderMilestone,
+    OrderActivity,
+    OrderTracking,
+    OrderDocument,
+    OrderPaymentProof,
+)
 from app.models.export_hub.payments import PaymentEscrow, PaymentMilestone, PaymentLink
 from app.models.export_hub.messaging import MessageAttachment
 from app.models.export_hub.misc import (
@@ -126,6 +133,7 @@ __all__ = [
     "OrderActivity",
     "OrderTracking",
     "OrderDocument",
+    "OrderPaymentProof",
     "PaymentEscrow",
     "PaymentMilestone",
     "PaymentLink",

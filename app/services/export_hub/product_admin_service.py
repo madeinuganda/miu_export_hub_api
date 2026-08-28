@@ -11,7 +11,12 @@ from app.models.export_hub.accounts import AdminAccount
 from app.models.export_hub.catalog import Category, Product, ProductImage
 from app.models.export_hub.organizations import SupplierOrganization
 from app.models.shared.enums import ProductStatus
-from app.schemas.export_hub.admin import AdminProductFeaturedUpdate, AdminProductListItem, AdminProductListResponse
+from app.schemas.export_hub.admin import (
+    AdminProductFeaturedUpdate,
+    AdminProductListItem,
+    AdminProductListResponse,
+    AdminProductReviewRequest,
+)
 from app.utils.audit import apply_update_audit
 from app.utils.formatting import format_ugx
 
@@ -50,6 +55,16 @@ class ProductAdminService:
             price_display=format_ugx(product.price_amount or 0),
             image_url=await ProductAdminService._primary_image(db, product.id),
             updated_at=product.updated_at,
+            submitted_at=product.submitted_at,
+            reviewed_at=product.reviewed_at,
+            review_note=product.review_note,
+            description=product.description,
+            moq_display=(
+                f"{product.moq_value:g} {product.moq_unit or 'units'}"
+                if product.moq_value
+                else None
+            ),
+            lead_time_days=product.lead_time_days,
         )
 
     @staticmethod
@@ -94,12 +109,32 @@ class ProductAdminService:
             ).scalar()
             or 0
         )
+        pending_review_count = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(Product)
+                    .where(
+                        Product.deleted_at.is_(None),
+                        Product.status == ProductStatus.PENDING_REVIEW,
+                    )
+                )
+            ).scalar()
+            or 0
+        )
         pages = max(1, math.ceil(total / page_size)) if total else 1
         offset = (page - 1) * page_size
 
+        # Listings waiting on MIU float to the top of the queue.
         products = (
             await db.execute(
-                query.order_by(Product.featured.desc(), Product.updated_at.desc()).offset(offset).limit(page_size)
+                query.order_by(
+                    (Product.status == ProductStatus.PENDING_REVIEW).desc(),
+                    Product.featured.desc(),
+                    Product.updated_at.desc(),
+                )
+                .offset(offset)
+                .limit(page_size)
             )
         ).scalars().all()
 
@@ -111,7 +146,23 @@ class ProductAdminService:
             total=total,
             pages=pages,
             featured_count=featured_count,
+            pending_review_count=pending_review_count,
         )
+
+    @staticmethod
+    async def review_product(
+        db: AsyncSession,
+        admin: AdminAccount,
+        product_id: UUID,
+        data: AdminProductReviewRequest,
+    ) -> AdminProductListItem:
+        from app.services.export_hub.product_review_service import ProductReviewService
+
+        await ProductReviewService.review(
+            db, admin.id, product_id, approved=data.approved, note=data.note
+        )
+        product = await db.get(Product, product_id)
+        return await ProductAdminService._to_item(db, product)
 
     @staticmethod
     async def set_featured(

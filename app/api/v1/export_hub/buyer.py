@@ -30,6 +30,7 @@ from app.models.export_hub.accounts import (
 )
 from app.services.export_hub.buyer_onboarding_service import BuyerOnboardingService
 from app.services.export_hub.catalog_service import CatalogService
+from app.services.export_hub.document_endpoints import ScopedDocuments
 from app.services.export_hub.order_service import OrderService
 from app.services.export_hub.payment_service import PaymentService
 from app.schemas.export_hub.payment import ExportHubPaymentInitResponse
@@ -360,6 +361,20 @@ async def decline_rfq(
     return await RfqService.decline_buyer_rfq(db, org_id, account.id, public_id)
 
 
+@router.get("/rfqs/{public_id}/documents/{doc_kind}")
+async def buyer_rfq_document(
+    public_id: str,
+    doc_kind: str,
+    db: AsyncSession = Depends(get_db),
+    org_id: UUID = Depends(require_onboarded_buyer_org_id),
+    _: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    """Download the RFQ (`rfq`) or the relayed quotation (`quote`) as a PDF."""
+    return await ScopedDocuments.rfq_document_response(
+        db, public_id, doc_kind, buyer_org_id=org_id
+    )
+
+
 class RfqMessageRequest(BaseModel):
     body: str
 
@@ -427,9 +442,15 @@ async def initiate_order_payment(
     )
 
 
-@router.get("/orders/{public_id}/invoice")
-async def buyer_invoice(public_id: str):
-    return {"url": f"/uploads/invoices/{public_id}.pdf", "stub": True}
+@router.get("/orders/{public_id}/documents/order")
+async def buyer_order_document(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    org_id: UUID = Depends(require_onboarded_buyer_org_id),
+    _: BuyerAccount = Depends(require_buyer_password_changed),
+):
+    """Order confirmation PDF."""
+    return await ScopedDocuments.order_document_response(db, public_id, buyer_org_id=org_id)
 
 
 @router.get("/orders/{public_id}/tracking")

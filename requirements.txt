@@ -11,6 +11,7 @@ bcrypt>=4.0.1,<4.1
 psycopg2-binary>=2.9.10
 python-multipart>=0.0.17
 Pillow>=11.0.0
+fpdf2>=2.7.9
 email-validator>=2.2.0
 httpx>=0.28.0
 eval_type_backport>=0.2.0

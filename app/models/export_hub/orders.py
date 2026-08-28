@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import Date, DateTime, Enum, Numeric, String, Text
+from sqlalchemy import Boolean, Date, DateTime, Enum, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -65,3 +65,31 @@ class OrderDocument(AuditMixin, Base):
     order_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
     doc_type: Mapped[str] = mapped_column(String(64), nullable=False)
     file_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+
+
+class OrderPaymentProof(AuditMixin, Base):
+    """An admin-recorded payment against an order (down payment, progressive
+    payment, completion). An order can carry many.
+
+    ``file_id`` holds a manually attached receipt; when absent MIU generates a
+    receipt PDF on demand. ``send_attachment`` controls whether the document is
+    attached to the notification emails.
+    """
+
+    __tablename__ = "order_payment_proofs"
+
+    order_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
+    reference_no: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    payment_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), default="UGX", nullable=False)
+    method: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    payment_reference: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    paid_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    file_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    file_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    send_attachment: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notify_buyer: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notify_supplier: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

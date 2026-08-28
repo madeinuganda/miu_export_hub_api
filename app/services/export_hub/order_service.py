@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.shared.config import get_settings
 from app.core.shared.exceptions import AppError
 from app.models.export_hub.catalog import Product
 from app.models.shared.enums import EscrowStatus, MilestoneState, OrderStatus, PaymentMilestoneStatus, QuoteStatus, RfqStatus
@@ -14,7 +15,9 @@ from app.models.export_hub.orders import Order, OrderActivity, OrderMilestone, O
 from app.models.export_hub.organizations import BuyerOrganization, SupplierOrganization
 from app.models.export_hub.payments import PaymentEscrow, PaymentLink, PaymentMilestone
 from app.models.export_hub.rfqs import Rfq, RfqQuote
+from app.services.export_hub.deal_documents import build_order_attachment
 from app.services.export_hub.rfq_service import RfqService
+from app.services.shared.email_service import EmailService
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
 from app.utils.formatting import format_money, format_quantity
 
@@ -175,15 +178,42 @@ class OrderService:
         quote.status = QuoteStatus.ACCEPTED
         apply_update_audit(rfq, user_id)
         apply_update_audit(quote, user_id)
+        await db.flush()
+
         from app.services.export_hub.rfq_service import RfqService
 
+        order_doc = await build_order_attachment(db, order)
         await RfqService.notify_supplier_quote_accepted(
             db,
             rfq,
             order_public_id=order.public_id,
             offered_price=format_money(quote.unit_price, quote.currency, rfq.unit),
+            attachment=order_doc,
         )
+        await OrderService.notify_buyer_order_created(db, order, attachment=order_doc)
         return {"orderId": order.public_id, "paymentLinkToken": token}
+
+    @staticmethod
+    async def notify_buyer_order_created(
+        db: AsyncSession, order: Order, *, attachment=None
+    ) -> None:
+        from app.services.export_hub.rfq_service import RfqService
+
+        account = await RfqService._primary_buyer_account(db, order.buyer_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, order.product_id)
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_buyer_order_created_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            order_public_id=order.public_id,
+            product_name=product.name if product else "Product",
+            quantity_label=format_quantity(order.quantity, order.unit),
+            total_value=format_money(order.total_value_amount, order.currency),
+            order_url=f"{base}/dashboard/buyer/orders/{order.public_id}",
+            attachments=[attachment] if attachment else None,
+        )
 
     @staticmethod
     async def _serialize_order_listing(db: AsyncSession, order: Order, tab: str) -> dict:
@@ -259,14 +289,18 @@ class OrderService:
         ).scalar_one_or_none()
         upfront = escrow.upfront_amount if escrow else Decimal(0)
         paid_percent = escrow.upfront_percent if escrow else 0
-        if escrow and escrow.status == EscrowStatus.BALANCE_RELEASED:
+        payment_pending = escrow is None or escrow.status == EscrowStatus.PENDING
+        if payment_pending:
+            paid_percent = 0
+        elif escrow.status == EscrowStatus.BALANCE_RELEASED:
             paid_percent = 100
+        currency = (escrow.currency if escrow else None) or order.currency
         return {
             **listing,
-            "paidAmount": format_money(
-                upfront, (escrow.currency if escrow else None) or order.currency
-            ),
+            "paidAmount": format_money(Decimal(0) if payment_pending else upfront, currency),
             "paidPercentLabel": f"{paid_percent}% paid",
+            "paymentPending": payment_pending,
+            "amountDue": format_money(upfront, currency) if payment_pending else None,
             "eta": tracking.eta_date.isoformat() if tracking and tracking.eta_date else "",
             "trackingNumber": tracking.tracking_number if tracking else None,
             "steps": [{"id": m.step_key, "label": m.label, "state": m.state.value} for m in milestones],

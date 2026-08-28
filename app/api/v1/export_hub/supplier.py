@@ -605,7 +605,14 @@ async def create_product(
             raise AppError(400, "Category not found or inactive", "invalid_category")
         category_label = cat.label
 
-    status_raw = str(data.get("status", "draft")).lower()
+    from app.services.export_hub.product_review_service import (
+        ProductReviewService,
+        product_status_label,
+        resolve_supplier_status,
+    )
+
+    # Suppliers cannot self-publish: asking to go live queues an admin review.
+    status = resolve_supplier_status(data.get("status"), None)
     p = Product(
         supplier_org_id=org.id,
         sku=data.get("sku", "PRD-NEW"),
@@ -614,13 +621,16 @@ async def create_product(
         subcategory=category_label,
         description=data.get("description"),
         origin_story=data.get("originStory") or data.get("origin_story"),
-        status=ProductStatus.DRAFT if status_raw == "draft" else ProductStatus.PUBLISHED,
+        status=status,
         moq_value=Decimal(str(data.get("moqValue", 100))),
         moq_unit=data.get("moqUnit", "kg"),
         price_amount=Decimal(str(data.get("priceAmount", 0))),
         lead_time_days=int(data["leadTimeDays"]) if data.get("leadTimeDays") is not None else None,
         stock_status=StockStatus.IN_STOCK,
         tone=data.get("tone", "coffee"),
+        submitted_at=datetime.now(timezone.utc)
+        if status == ProductStatus.PENDING_REVIEW
+        else None,
     )
     apply_create_audit(p, account.id)
     db.add(p)
@@ -634,7 +644,28 @@ async def create_product(
         apply_create_audit(cert, account.id)
         db.add(cert)
     await db.flush()
-    return {"id": str(p.id)}
+
+    if p.status == ProductStatus.PENDING_REVIEW:
+        await ProductReviewService.notify_submitted(db, p)
+
+    return {
+        "id": str(p.id),
+        "status": p.status.value,
+        "statusLabel": product_status_label(p.status.value),
+    }
+
+
+@router.post("/products/{product_id}/submit")
+async def submit_product_for_review(
+    product_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(get_supplier_org),
+    account: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    """Send a draft (or previously rejected) listing to the MIU review queue."""
+    from app.services.export_hub.product_review_service import ProductReviewService
+
+    return await ProductReviewService.submit_for_review(db, org.id, account.id, product_id)
 
 
 @router.get("/products/{product_id}")
@@ -700,10 +731,29 @@ async def supplier_rfq_detail(public_id: str, db: AsyncSession = Depends(get_db)
     from app.utils.formatting import format_quantity, format_relative_time, format_ugx
     product = await db.get(Product, rfq.product_id)
     st = await RfqService.supplier_inbox_status(rfq, db)
+    quote = await RfqService.latest_quote(db, rfq.id)
     return {
         "id": rfq.public_id,
         "product": product.name if product else "",
         "status": st,
+        "quote": (
+            {
+                "id": str(quote.id),
+                "status": quote.status.value,
+                "unitPrice": float(quote.unit_price),
+                "currency": quote.currency,
+                "incoterm": quote.incoterm,
+                "leadTimeDays": quote.lead_time_days,
+                "shipmentTerms": quote.shipment_terms,
+                "notes": quote.notes,
+                "adminRemarks": quote.admin_remarks,
+                "submittedAt": quote.submitted_at.isoformat() if quote.submitted_at else None,
+                "sentAt": quote.sent_at.isoformat() if quote.sent_at else None,
+            }
+            if quote
+            else None
+        ),
+        "adminRemarks": quote.admin_remarks if quote else None,
         "sampleRequested": rfq.sample_requested,
         "received": format_relative_time(rfq.sent_at),
         "buyer": "via MIU Admin",
@@ -742,7 +792,24 @@ async def supplier_send_rfq_message(
 
 @router.post("/rfqs/{public_id}/quote")
 async def submit_quote(public_id: str, data: SubmitQuoteRequest, db: AsyncSession = Depends(get_db), org: SupplierOrganization = Depends(require_approved_supplier), account: SupplierAccount = Depends(require_supplier_password_changed)):
+    """Submit a quote for MIU review; it reaches the buyer once an admin relays it."""
     return await RfqService.submit_quote(db, org.id, account.id, public_id, data)
+
+
+@router.get("/rfqs/{public_id}/documents/{doc_kind}")
+async def supplier_rfq_document(
+    public_id: str,
+    doc_kind: str,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(require_approved_supplier),
+    _: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    """Download the RFQ (`rfq`) or your quotation (`quote`) as a PDF."""
+    from app.services.export_hub.document_endpoints import ScopedDocuments
+
+    return await ScopedDocuments.rfq_document_response(
+        db, public_id, doc_kind, supplier_org_id=org.id
+    )
 
 
 @router.post("/rfqs/{public_id}/decline")
@@ -822,6 +889,21 @@ async def advance_supplier_order(
     """Supplier-triggered transition: In Production -> Ready to Dispatch. Shipping and
     payment release stages remain admin-controlled."""
     return await OrderService.advance_supplier_order(db, org.id, public_id, account.id)
+
+
+@router.get("/orders/{public_id}/documents/order")
+async def supplier_order_document(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    org: SupplierOrganization = Depends(require_approved_supplier),
+    _: SupplierAccount = Depends(require_supplier_password_changed),
+):
+    """Order confirmation PDF."""
+    from app.services.export_hub.document_endpoints import ScopedDocuments
+
+    return await ScopedDocuments.order_document_response(
+        db, public_id, supplier_org_id=org.id
+    )
 
 
 async def _supplier_owned_order(db: AsyncSession, org_id: UUID, public_id: str) -> Order:

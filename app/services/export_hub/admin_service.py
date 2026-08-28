@@ -58,7 +58,7 @@ from app.schemas.export_hub.admin import (
 )
 from app.services.shared.email_service import EmailService
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
-from app.utils.formatting import format_quantity, format_ugx
+from app.utils.formatting import format_money, format_quantity, format_ugx
 from app.utils.pagination import paginate
 
 # ADMIN_PIPELINE and friends now live in order_service.py so admin, supplier,
@@ -252,6 +252,12 @@ class AdminService:
 
             action = "review_and_route" if admin_status == "new" else "view"
             pending_messages = await RfqService.pending_message_count(db, rfq.id)
+            latest_quote = await RfqService.latest_quote(db, rfq.id)
+            quote_pending = bool(
+                latest_quote and latest_quote.status == QuoteStatus.PENDING_REVIEW
+            )
+            if quote_pending:
+                action = "review_quote"
             all_items.append(
                 AdminRfqListItem(
                     id=rfq.id,
@@ -268,12 +274,16 @@ class AdminService:
                     assigned_admin_name=AdminService._admin_short_name(admin),
                     action=action,
                     pending_message_count=pending_messages,
+                    quote_pending_review=quote_pending,
                 )
             )
 
         items = all_items
         if status and status != "all":
-            items = [i for i in all_items if i.status == status]
+            if status == "quote_pending_review":
+                items = [i for i in all_items if i.quote_pending_review]
+            else:
+                items = [i for i in all_items if i.status == status]
 
         new_count = sum(1 for i in all_items if i.status == "new")
         active_week = sum(
@@ -282,7 +292,9 @@ class AdminService:
             if (rfq.sent_at or rfq.created_at) >= week_ago and rfq.status not in (RfqStatus.CANCELLED, RfqStatus.EXPIRED)
         )
         avg_hours = round(sum(response_hours) / len(response_hours), 1) if response_hours else None
-        needs_review = sum(1 for i in all_items if i.pending_message_count > 0)
+        needs_review = sum(
+            1 for i in all_items if i.pending_message_count > 0 or i.quote_pending_review
+        )
         paged = paginate(items, page, page_size)
         return AdminRfqListResponse(
             summary=AdminRfqListSummary(
@@ -291,6 +303,7 @@ class AdminService:
                 avg_response_hours=avg_hours,
                 active_this_week=active_week,
                 needs_review_count=needs_review,
+                quote_review_count=sum(1 for i in all_items if i.quote_pending_review),
             ),
             items=paged.items,
             page=paged.page,
@@ -387,9 +400,24 @@ class AdminService:
                     "currency": q.currency,
                     "status": q.status.value,
                     "notes": q.notes,
+                    "incoterm": q.incoterm,
+                    "lead_time_days": q.lead_time_days,
+                    "shipment_terms": q.shipment_terms,
+                    "total_display": format_money(q.unit_price * rfq.quantity, q.currency),
+                    "unit_price_display": format_money(q.unit_price, q.currency, rfq.unit),
+                    "admin_remarks": q.admin_remarks,
+                    "submitted_at": q.submitted_at.isoformat() if q.submitted_at else None,
+                    "sent_at": q.sent_at.isoformat() if q.sent_at else None,
+                    "reviewed_at": q.reviewed_at.isoformat() if q.reviewed_at else None,
+                    "awaiting_review": q.status == QuoteStatus.PENDING_REVIEW,
+                    "can_relay": q.status in (QuoteStatus.PENDING_REVIEW, QuoteStatus.RETURNED),
+                    "can_return": q.status == QuoteStatus.PENDING_REVIEW,
                 }
                 for q in quotes
             ],
+            "pending_quote_count": sum(
+                1 for q in quotes if q.status == QuoteStatus.PENDING_REVIEW
+            ),
             "messages": messages,
             "pending_message_count": pending_message_count,
             "assignment_history": history,
@@ -440,6 +468,10 @@ class AdminService:
             return "order_created"
         if rfq.status == RfqStatus.ACCEPTED or (quote and quote.status == QuoteStatus.ACCEPTED):
             return "accepted"
+        if quote and quote.status == QuoteStatus.PENDING_REVIEW:
+            return "quote_pending_review"
+        if quote and quote.status == QuoteStatus.RETURNED:
+            return "quote_returned"
         if quote and quote.status == QuoteStatus.SENT:
             return "quote_sent"
         return "active"
@@ -508,11 +540,20 @@ class AdminService:
                     last_activity_at=last_at,
                     assigned_admin_name=AdminService._admin_short_name(admin),
                     pending_message_count=pending_messages,
+                    quote_pending_review=bool(
+                        quote and quote.status == QuoteStatus.PENDING_REVIEW
+                    ),
                 )
             )
 
-        active = sum(1 for i in items if i.status in ("active", "quote_sent"))
-        needs_review = sum(1 for i in items if i.pending_message_count > 0)
+        active = sum(
+            1
+            for i in items
+            if i.status in ("active", "quote_sent", "quote_pending_review", "quote_returned")
+        )
+        needs_review = sum(
+            1 for i in items if i.pending_message_count > 0 or i.quote_pending_review
+        )
         paged = paginate(items, page, page_size)
         return AdminDealListResponse(
             active_deals_count=active,
@@ -548,33 +589,29 @@ class AdminService:
         return detail
 
     @staticmethod
-    async def relay_quote(db: AsyncSession, admin: AdminAccount, public_id: str, data: RelayQuoteRequest) -> dict:
-        rfq = (
-            await db.execute(select(Rfq).where(Rfq.public_id == public_id, Rfq.deleted_at.is_(None)))
-        ).scalar_one_or_none()
-        if not rfq:
-            raise AppError(404, "RFQ not found", "not_found")
-
-        if data.quote_id:
-            quote = await db.get(RfqQuote, data.quote_id)
+    async def _resolve_reviewable_quote(
+        db: AsyncSession, rfq: Rfq, quote_id: UUID | None
+    ) -> RfqQuote:
+        if quote_id:
+            quote = await db.get(RfqQuote, quote_id)
         else:
-            quote = (
-                await db.execute(
-                    select(RfqQuote)
-                    .where(RfqQuote.rfq_id == rfq.id, RfqQuote.deleted_at.is_(None))
-                    .order_by(RfqQuote.created_at.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-
-        if not quote or quote.rfq_id != rfq.id:
+            quote = await RfqService.latest_quote(db, rfq.id)
+        if not quote or quote.rfq_id != rfq.id or quote.deleted_at:
             raise AppError(404, "Quote not found", "not_found")
+        return quote
 
-        quote.status = QuoteStatus.SENT
-        quote.sent_at = datetime.now(timezone.utc)
-        apply_update_audit(quote, admin.id)
-        rfq.status = RfqStatus.RESPONDED
-        apply_update_audit(rfq, admin.id)
+    @staticmethod
+    async def relay_quote(db: AsyncSession, admin: AdminAccount, public_id: str, data: RelayQuoteRequest) -> dict:
+        """Release a supplier quote to the buyer after MIU review."""
+        rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
+        quote = await AdminService._resolve_reviewable_quote(db, rfq, data.quote_id)
+
+        if quote.status in (QuoteStatus.ACCEPTED, QuoteStatus.DECLINED):
+            raise AppError(400, "This quote has already been closed", "invalid_status")
+        if quote.status == QuoteStatus.SENT:
+            raise AppError(400, "This quote is already with the buyer", "invalid_status")
+
+        await RfqService.relay_quote_to_buyer(db, rfq, quote, admin.id)
 
         if data.message:
             msg = await RfqService.add_message(db, rfq.id, SenderRole.ADMIN, data.message, admin.id)
@@ -596,7 +633,43 @@ class AdminService:
         )
         apply_create_audit(log, admin.id)
         db.add(log)
-        return {"ok": True, "public_id": rfq.public_id, "deal_id": AdminService._deal_public_id(rfq)}
+        return {
+            "ok": True,
+            "public_id": rfq.public_id,
+            "deal_id": AdminService._deal_public_id(rfq),
+            "quote_status": quote.status.value,
+        }
+
+    @staticmethod
+    async def return_quote(
+        db: AsyncSession, admin: AdminAccount, public_id: str, data: ReturnQuoteRequest
+    ) -> dict:
+        """Bounce a quote back to the supplier; the buyer never sees it."""
+        rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
+        quote = await AdminService._resolve_reviewable_quote(db, rfq, data.quote_id)
+
+        if quote.status != QuoteStatus.PENDING_REVIEW:
+            raise AppError(
+                400, "Only a quote pending review can be returned", "invalid_status"
+            )
+
+        await RfqService.return_quote_to_supplier(db, rfq, quote, admin.id, data.remarks)
+
+        log = AdminActionLog(
+            admin_account_id=admin.id,
+            action="return_quote",
+            entity_type="rfq",
+            entity_id=rfq.id,
+            metadata_={"quote_id": str(quote.id), "remarks": data.remarks},
+        )
+        apply_create_audit(log, admin.id)
+        db.add(log)
+        return {
+            "ok": True,
+            "public_id": rfq.public_id,
+            "deal_id": AdminService._deal_public_id(rfq),
+            "quote_status": quote.status.value,
+        }
 
     @staticmethod
     async def _resolve_rfq_by_public_id(db: AsyncSession, public_id: str) -> Rfq:

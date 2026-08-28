@@ -20,14 +20,34 @@ from app.models.export_hub.organizations import (
     SupplierOrganizationMember,
 )
 from app.models.export_hub.rfqs import Rfq, RfqMessage, RfqQuote
+from app.services.export_hub.deal_documents import (
+    build_quote_attachment,
+    build_rfq_attachment,
+)
 from app.services.shared.email_service import EmailService
+from app.services.shared.notifications.email_templates import EmailAttachment
 from app.utils.audit import apply_create_audit, apply_update_audit
 from app.utils.formatting import format_quantity, format_relative_time, format_money, format_ugx
+
+
+def _only(attachment: EmailAttachment | None) -> list[EmailAttachment]:
+    """Attachment list for a builder that returns None when PDFs are disabled."""
+    return [attachment] if attachment else []
 
 OTHER_PARTY_ROLE = {
     SenderRole.BUYER: SenderRole.SUPPLIER,
     SenderRole.SUPPLIER: SenderRole.BUYER,
 }
+
+# A quote only reaches the buyer after MIU Admin relays it (status SENT).
+BUYER_VISIBLE_QUOTE_STATUSES = (
+    QuoteStatus.SENT.value,
+    QuoteStatus.ACCEPTED.value,
+    QuoteStatus.DECLINED.value,
+)
+
+# Statuses a supplier may overwrite by re-submitting rather than adding a row.
+REOPENABLE_QUOTE_STATUSES = (QuoteStatus.PENDING_REVIEW, QuoteStatus.RETURNED, QuoteStatus.DRAFT)
 
 
 class CreateRfqRequest(BaseModel):
@@ -100,26 +120,59 @@ class RfqService:
         if data.message and data.message.strip():
             await RfqService.add_message(db, rfq.id, SenderRole.BUYER, data.message.strip(), user_id)
         await RfqService.notify_supplier_new_rfq(db, rfq)
+        await RfqService.notify_buyer_rfq_submitted(db, rfq)
         return rfq
+
+    @staticmethod
+    async def buyer_visible_quote(db: AsyncSession, rfq_id: UUID) -> RfqQuote | None:
+        """The latest quote MIU Admin has relayed to the buyer.
+
+        Quotes sit in PENDING_REVIEW (or RETURNED) until an admin relays them,
+        so anything not yet SENT must stay invisible on buyer surfaces.
+        """
+        return (
+            await db.execute(
+                select(RfqQuote)
+                .where(
+                    RfqQuote.rfq_id == rfq_id,
+                    RfqQuote.status.in_(BUYER_VISIBLE_QUOTE_STATUSES),
+                    RfqQuote.deleted_at.is_(None),
+                )
+                .order_by(RfqQuote.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    @staticmethod
+    async def latest_quote(db: AsyncSession, rfq_id: UUID) -> RfqQuote | None:
+        return (
+            await db.execute(
+                select(RfqQuote)
+                .where(RfqQuote.rfq_id == rfq_id, RfqQuote.deleted_at.is_(None))
+                .order_by(RfqQuote.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
 
     @staticmethod
     async def _serialize_buyer_listing(db: AsyncSession, rfq: Rfq) -> dict:
         product = await db.get(Product, rfq.product_id)
         supplier = await db.get(SupplierOrganization, rfq.supplier_org_id)
-        quote = (
-            await db.execute(
-                select(RfqQuote).where(RfqQuote.rfq_id == rfq.id, RfqQuote.deleted_at.is_(None)).order_by(RfqQuote.created_at.desc()).limit(1)
-            )
-        ).scalar_one_or_none()
+        quote = await RfqService.buyer_visible_quote(db, rfq.id)
         status_map = {
             RfqStatus.AWAITING: "awaiting",
             RfqStatus.RESPONDED: "responded",
             RfqStatus.ACCEPTED: "accepted",
             RfqStatus.DECLINED: "declined",
         }
+        status = status_map.get(rfq.status, "awaiting")
+        # RESPONDED is only reachable once an admin relays a quote, but guard
+        # against legacy rows so the buyer never sees "responded" with no quote.
+        if status == "responded" and quote is None:
+            status = "awaiting"
         return {
             "id": rfq.public_id,
-            "status": status_map.get(rfq.status, "awaiting"),
+            "status": status,
             "productName": product.name if product else "",
             "supplierName": supplier.name if supplier else "via MIU",
             "quantity": format_quantity(rfq.quantity, rfq.unit),
@@ -128,6 +181,17 @@ class RfqService:
             "offeredPrice": format_ugx(quote.unit_price, rfq.unit) if quote else None,
             "destination": rfq.destination_port or "",
             "supplierResponse": quote.notes if quote else None,
+            "incoterm": (quote.incoterm if quote and quote.incoterm else rfq.incoterm) or "",
+            "leadTime": (
+                f"{quote.lead_time_days} days" if quote and quote.lead_time_days else ""
+            ),
+            "shipmentTerms": (quote.shipment_terms if quote else "") or "",
+            "totalValue": (
+                format_money(quote.unit_price * rfq.quantity, quote.currency)
+                if quote
+                else None
+            ),
+            "canAccept": bool(quote and quote.status == QuoteStatus.SENT),
         }
 
     @staticmethod
@@ -150,13 +214,19 @@ class RfqService:
 
     @staticmethod
     async def supplier_inbox_status(rfq: Rfq, db: AsyncSession) -> str:
-        quote = (
-            await db.execute(select(RfqQuote).where(RfqQuote.rfq_id == rfq.id, RfqQuote.deleted_at.is_(None)).limit(1))
-        ).scalar_one_or_none()
+        quote = await RfqService.latest_quote(db, rfq.id)
         if rfq.status == RfqStatus.ACCEPTED:
             return "accepted"
-        if quote and quote.status in (QuoteStatus.SENT, QuoteStatus.ACCEPTED):
+        if not quote:
+            return "new"
+        if quote.status == QuoteStatus.PENDING_REVIEW:
+            return "quote_pending"
+        if quote.status == QuoteStatus.RETURNED:
+            return "quote_returned"
+        if quote.status in (QuoteStatus.SENT, QuoteStatus.ACCEPTED):
             return "quote_sent"
+        if quote.status == QuoteStatus.DECLINED:
+            return "declined"
         return "new"
 
     @staticmethod
@@ -186,30 +256,81 @@ class RfqService:
 
     @staticmethod
     async def submit_quote(db: AsyncSession, org_id: UUID, user_id: UUID, public_id: str, data: SubmitQuoteRequest) -> dict:
+        """Submit (or re-submit) a quote for MIU Admin review.
+
+        The quote is *not* delivered to the buyer here — it waits in
+        PENDING_REVIEW until an admin relays it, mirroring message moderation.
+        """
         rfq = (
             await db.execute(select(Rfq).where(Rfq.public_id == public_id, Rfq.supplier_org_id == org_id, Rfq.deleted_at.is_(None)))
         ).scalar_one_or_none()
         if not rfq:
             raise AppError(404, "RFQ not found", "not_found")
-        quote = RfqQuote(
-            rfq_id=rfq.id,
-            supplier_org_id=org_id,
-            unit_price=data.unit_price,
-            currency=data.currency,
-            incoterm=data.incoterm,
-            lead_time_days=data.lead_time_days,
-            shipment_terms=data.shipment_terms,
-            notes=data.notes,
-            status=QuoteStatus.SENT,
-            sent_at=datetime.now(timezone.utc),
-        )
-        apply_create_audit(quote, user_id)
-        db.add(quote)
+        if rfq.status in (RfqStatus.ACCEPTED, RfqStatus.DECLINED, RfqStatus.CANCELLED, RfqStatus.EXPIRED):
+            raise AppError(400, "This RFQ is closed", "invalid_status")
+
+        existing = await RfqService.latest_quote(db, rfq.id)
+        now = datetime.now(timezone.utc)
+        if existing and existing.status in REOPENABLE_QUOTE_STATUSES:
+            quote = existing
+            quote.admin_remarks = None
+            quote.reviewed_at = None
+            quote.reviewed_by = None
+            apply_update_audit(quote, user_id)
+        else:
+            if existing and existing.status in (QuoteStatus.SENT, QuoteStatus.ACCEPTED):
+                raise AppError(
+                    400,
+                    "A quote has already been sent to the buyer for this RFQ",
+                    "invalid_status",
+                )
+            quote = RfqQuote(rfq_id=rfq.id, supplier_org_id=org_id)
+            apply_create_audit(quote, user_id)
+            db.add(quote)
+
+        quote.unit_price = data.unit_price
+        quote.currency = data.currency
+        quote.incoterm = data.incoterm
+        quote.lead_time_days = data.lead_time_days
+        quote.shipment_terms = data.shipment_terms
+        quote.notes = data.notes
+        quote.status = QuoteStatus.PENDING_REVIEW
+        quote.submitted_at = now
+        quote.sent_at = None
+        await db.flush()
+
+        await RfqService.notify_supplier_quote_submitted(db, rfq, quote)
+        return {"status": "quote_pending_review"}
+
+    @staticmethod
+    async def relay_quote_to_buyer(
+        db: AsyncSession, rfq: Rfq, quote: RfqQuote, admin_id: UUID
+    ) -> None:
+        """Mark a reviewed quote as delivered and notify both parties."""
+        quote.status = QuoteStatus.SENT
+        quote.sent_at = datetime.now(timezone.utc)
+        quote.reviewed_at = datetime.now(timezone.utc)
+        quote.reviewed_by = admin_id
+        apply_update_audit(quote, admin_id)
         rfq.status = RfqStatus.RESPONDED
-        apply_update_audit(rfq, user_id)
+        apply_update_audit(rfq, admin_id)
         await db.flush()
         await RfqService.notify_buyer_quote_received(db, rfq, quote)
-        return {"status": "quote_sent"}
+        await RfqService.notify_supplier_quote_relayed(db, rfq, quote)
+
+    @staticmethod
+    async def return_quote_to_supplier(
+        db: AsyncSession, rfq: Rfq, quote: RfqQuote, admin_id: UUID, remarks: str
+    ) -> None:
+        """Bounce a quote back to the supplier without showing it to the buyer."""
+        quote.status = QuoteStatus.RETURNED
+        quote.admin_remarks = remarks
+        quote.reviewed_at = datetime.now(timezone.utc)
+        quote.reviewed_by = admin_id
+        quote.sent_at = None
+        apply_update_audit(quote, admin_id)
+        await db.flush()
+        await RfqService.notify_supplier_quote_returned(db, rfq, quote, remarks)
 
     @staticmethod
     async def _primary_supplier_account(db: AsyncSession, org_id: UUID) -> SupplierAccount | None:
@@ -265,6 +386,26 @@ class RfqService:
             destination=rfq.destination_port,
             note=note,
             rfq_url=f"{base}/dashboard/supplier/rfq?id={rfq.public_id}",
+            attachments=_only(await build_rfq_attachment(db, rfq)),
+        )
+
+    @staticmethod
+    async def notify_buyer_rfq_submitted(db: AsyncSession, rfq: Rfq) -> None:
+        account = await RfqService._primary_buyer_account(db, rfq.buyer_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, rfq.product_id)
+        supplier = await db.get(SupplierOrganization, rfq.supplier_org_id)
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_buyer_rfq_submitted_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            rfq_public_id=rfq.public_id,
+            product_name=product.name if product else "Product",
+            quantity_label=format_quantity(rfq.quantity, rfq.unit),
+            supplier_name=supplier.name if supplier else None,
+            rfq_url=f"{base}/dashboard/buyer/rfqs?id={rfq.public_id}",
+            attachments=_only(await build_rfq_attachment(db, rfq)),
         )
 
     @staticmethod
@@ -283,6 +424,58 @@ class RfqService:
             offered_price=format_ugx(quote.unit_price, rfq.unit),
             notes=quote.notes,
             rfq_url=f"{base}/dashboard/buyer/rfqs?id={rfq.public_id}",
+            attachments=_only(await build_quote_attachment(db, rfq, quote)),
+        )
+
+    @staticmethod
+    async def notify_supplier_quote_submitted(db: AsyncSession, rfq: Rfq, quote: RfqQuote) -> None:
+        account = await RfqService._primary_supplier_account(db, rfq.supplier_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, rfq.product_id)
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_supplier_quote_submitted_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            rfq_public_id=rfq.public_id,
+            product_name=product.name if product else "Product",
+            offered_price=format_money(quote.unit_price, quote.currency, rfq.unit),
+            rfq_url=f"{base}/dashboard/supplier/rfq?id={rfq.public_id}",
+            attachments=_only(await build_quote_attachment(db, rfq, quote)),
+        )
+
+    @staticmethod
+    async def notify_supplier_quote_relayed(db: AsyncSession, rfq: Rfq, quote: RfqQuote) -> None:
+        account = await RfqService._primary_supplier_account(db, rfq.supplier_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, rfq.product_id)
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_supplier_quote_relayed_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            rfq_public_id=rfq.public_id,
+            product_name=product.name if product else "Product",
+            offered_price=format_money(quote.unit_price, quote.currency, rfq.unit),
+            rfq_url=f"{base}/dashboard/supplier/rfq?id={rfq.public_id}",
+        )
+
+    @staticmethod
+    async def notify_supplier_quote_returned(
+        db: AsyncSession, rfq: Rfq, quote: RfqQuote, remarks: str
+    ) -> None:
+        account = await RfqService._primary_supplier_account(db, rfq.supplier_org_id)
+        if not account or not account.email:
+            return
+        product = await db.get(Product, rfq.product_id)
+        base = get_settings().frontend_base_url.rstrip("/")
+        await EmailService.send_supplier_quote_returned_email(
+            to_email=account.email,
+            first_name=account.first_name or "there",
+            rfq_public_id=rfq.public_id,
+            product_name=product.name if product else "Product",
+            remarks=remarks,
+            rfq_url=f"{base}/dashboard/supplier/rfq?id={rfq.public_id}",
         )
 
     @staticmethod
@@ -292,6 +485,7 @@ class RfqService:
         *,
         order_public_id: str,
         offered_price: str,
+        attachment: EmailAttachment | None = None,
     ) -> None:
         account = await RfqService._primary_supplier_account(db, rfq.supplier_org_id)
         if not account or not account.email:
@@ -308,6 +502,7 @@ class RfqService:
             quantity_label=format_quantity(rfq.quantity, rfq.unit),
             offered_price=offered_price,
             order_url=f"{base}/dashboard/supplier/orders/{order_public_id}",
+            attachments=_only(attachment),
         )
 
     @staticmethod

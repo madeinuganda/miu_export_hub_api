@@ -31,6 +31,11 @@ class RelayQuoteRequest(BaseModel):
     message: str | None = None
 
 
+class ReturnQuoteRequest(BaseModel):
+    quote_id: UUID | None = None
+    remarks: str = Field(min_length=1, description="Shown to the supplier")
+
+
 class AdminMessageRequest(BaseModel):
     body: str
 
@@ -85,6 +90,7 @@ class AdminRfqListItem(BaseModel):
     assigned_admin_name: str | None
     action: str
     pending_message_count: int = 0
+    quote_pending_review: bool = False
 
 
 class AdminRfqListSummary(BaseModel):
@@ -93,6 +99,7 @@ class AdminRfqListSummary(BaseModel):
     avg_response_hours: float | None
     active_this_week: int
     needs_review_count: int = 0
+    quote_review_count: int = 0
 
 
 class AdminRfqListResponse(BaseModel):
@@ -118,6 +125,7 @@ class AdminDealListItem(BaseModel):
     last_activity_at: datetime | None
     assigned_admin_name: str | None
     pending_message_count: int = 0
+    quote_pending_review: bool = False
 
 
 class AdminDealListResponse(BaseModel):
@@ -269,6 +277,13 @@ class AdminProductFeaturedUpdate(BaseModel):
     featured: bool
 
 
+class AdminProductReviewRequest(BaseModel):
+    approved: bool
+    note: str | None = Field(
+        default=None, description="Required when rejecting; shown to the supplier"
+    )
+
+
 class AdminProductListItem(BaseModel):
     id: UUID
     sku: str
@@ -281,6 +296,12 @@ class AdminProductListItem(BaseModel):
     price_display: str
     image_url: str | None
     updated_at: datetime
+    submitted_at: datetime | None = None
+    reviewed_at: datetime | None = None
+    review_note: str | None = None
+    description: str | None = None
+    moq_display: str | None = None
+    lead_time_days: int | None = None
 
 
 class AdminProductListResponse(BaseModel):
@@ -290,3 +311,54 @@ class AdminProductListResponse(BaseModel):
     total: int
     pages: int
     featured_count: int
+    pending_review_count: int = 0
+
+
+class AdminPaymentProofRequest(BaseModel):
+    payment_type: str = Field(
+        description="down_payment | progress_payment | final_payment | refund | other"
+    )
+    amount: Decimal = Field(gt=0)
+    currency: str = "UGX"
+    method: str | None = None
+    payment_reference: str | None = None
+    paid_at: str | None = Field(default=None, description="ISO date, e.g. 2026-08-27")
+    note: str | None = None
+    send_attachment: bool = Field(
+        default=True, description="Attach the proof document to notification emails"
+    )
+    notify_buyer: bool = True
+    notify_supplier: bool = True
+
+
+class AdminPaymentProofItem(BaseModel):
+    id: UUID
+    reference_no: str
+    payment_type: str
+    payment_type_label: str
+    amount: Decimal
+    amount_display: str
+    currency: str
+    method: str | None = None
+    payment_reference: str | None = None
+    paid_at: str | None = None
+    note: str | None = None
+    file_url: str | None = None
+    file_name: str | None = None
+    has_upload: bool = False
+    receipt_url: str
+    send_attachment: bool = True
+    notify_buyer: bool = True
+    notify_supplier: bool = True
+    notified_at: datetime | None = None
+    recorded_by: str | None = None
+    created_at: datetime
+
+
+class AdminPaymentProofListResponse(BaseModel):
+    order_public_id: str
+    order_total_display: str
+    total_recorded: Decimal
+    total_recorded_display: str
+    outstanding_display: str
+    items: list[AdminPaymentProofItem]

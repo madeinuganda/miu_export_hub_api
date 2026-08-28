@@ -14,6 +14,7 @@ from app.models.export_hub.catalog import Category, Product, ProductBadge, Produ
 from app.models.shared.enums import ProductStatus
 from app.models.export_hub.organizations import SupplierOrganization
 from app.services.export_hub.browse_service import BrowseService
+from app.services.export_hub.product_review_service import product_status_label
 from app.services.shared.file_storage import public_file_url, store_upload_bytes
 from app.utils.audit import apply_create_audit, apply_update_audit, soft_delete
 from app.utils.formatting import format_quantity, format_ugx
@@ -239,12 +240,29 @@ class CatalogService:
                     "certifications": list(certs),
                     "stockStatus": stock_map.get(p.stock_status.value, "In Stock"),
                     "status": p.status.value,
+                    "statusLabel": product_status_label(p.status.value),
+                    "reviewNote": p.review_note,
+                    "submittedAt": p.submitted_at.isoformat() if p.submitted_at else None,
+                    "reviewedAt": p.reviewed_at.isoformat() if p.reviewed_at else None,
+                    "canSubmitForReview": p.status
+                    in (ProductStatus.DRAFT, ProductStatus.REJECTED, ProductStatus.ARCHIVED),
                     "thumbTone": p.tone or "coffee",
                     "imageUrl": image_url,
                 }
             )
         published = sum(1 for r in rows if r["status"] == "published")
-        return {"summary": {"total": len(rows), "published": published, "storefrontPublished": published}, "items": rows}
+        pending = sum(1 for r in rows if r["status"] == "pending_review")
+        rejected = sum(1 for r in rows if r["status"] == "rejected")
+        return {
+            "summary": {
+                "total": len(rows),
+                "published": published,
+                "storefrontPublished": published,
+                "pendingReview": pending,
+                "changesRequested": rejected,
+            },
+            "items": rows,
+        }
 
     @staticmethod
     async def supplier_product_detail(db: AsyncSession, org_id: UUID, product_id: UUID) -> dict:
@@ -281,6 +299,12 @@ class CatalogService:
             **listing,
             "sku": product.sku,
             "status": product.status.value,
+            "statusLabel": product_status_label(product.status.value),
+            "reviewNote": product.review_note,
+            "submittedAt": product.submitted_at.isoformat() if product.submitted_at else None,
+            "reviewedAt": product.reviewed_at.isoformat() if product.reviewed_at else None,
+            "canSubmitForReview": product.status
+            in (ProductStatus.DRAFT, ProductStatus.REJECTED, ProductStatus.ARCHIVED),
             "shortDescription": product.description or "",
             "originStory": product.origin_story or "",
             "images": list(images) or ([listing.get("image")] if listing.get("image") else []),
@@ -317,9 +341,22 @@ class CatalogService:
         from app.core.shared.exceptions import AppError
         from app.utils.audit import apply_update_audit
 
+        from app.services.export_hub.product_review_service import (
+            ProductReviewService,
+            mark_submitted,
+            product_certifications,
+            resolve_supplier_status,
+            review_fingerprint,
+        )
+
         product = await db.get(Product, product_id)
         if not product or product.deleted_at or product.supplier_org_id != org_id:
             raise AppError(404, "Product not found", "not_found")
+
+        was_published = product.status == ProductStatus.PUBLISHED
+        fingerprint_before = review_fingerprint(
+            product, await product_certifications(db, product.id)
+        )
 
         if "name" in data and data["name"]:
             product.name = str(data["name"]).strip()
@@ -346,8 +383,7 @@ class CatalogService:
             product.subcategory = str(category_label)
 
         if "status" in data and data["status"] is not None:
-            status_raw = str(data["status"]).lower()
-            product.status = ProductStatus.DRAFT if status_raw == "draft" else ProductStatus.PUBLISHED
+            product.status = resolve_supplier_status(data["status"], product.status)
 
         if "moqValue" in data and data["moqValue"] is not None:
             product.moq_value = Decimal(str(data["moqValue"]))
@@ -387,6 +423,21 @@ class CatalogService:
 
         apply_update_audit(product, account_id)
         await db.flush()
+
+        # Edits to reviewed content on a live listing go back through the queue
+        # so buyers never see changes MIU has not seen.
+        entered_review = product.status == ProductStatus.PENDING_REVIEW
+        if was_published and product.status == ProductStatus.PUBLISHED:
+            fingerprint_after = review_fingerprint(
+                product, await product_certifications(db, product.id)
+            )
+            if fingerprint_after != fingerprint_before:
+                mark_submitted(product, account_id)
+                await db.flush()
+                entered_review = True
+        if entered_review:
+            await ProductReviewService.notify_submitted(db, product)
+
         return await CatalogService.supplier_product_detail(db, org_id, product_id)
 
     @staticmethod

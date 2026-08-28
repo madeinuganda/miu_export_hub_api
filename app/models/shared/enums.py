@@ -51,8 +51,16 @@ class VerificationStatus(str, enum.Enum):
 
 
 class ProductStatus(str, enum.Enum):
+    """Supplier listings are published only after MIU catalogue review.
+
+    Suppliers move a listing DRAFT -> PENDING_REVIEW; only an admin can set
+    PUBLISHED or REJECTED.
+    """
+
     DRAFT = "draft"
+    PENDING_REVIEW = "pending_review"
     PUBLISHED = "published"
+    REJECTED = "rejected"
     ARCHIVED = "archived"
 
 
@@ -72,10 +80,37 @@ class RfqStatus(str, enum.Enum):
 
 
 class QuoteStatus(str, enum.Enum):
+    """Supplier quotes are relayed to the buyer by MIU Admin, mirroring how
+    deal messages are moderated: a submitted quote sits in PENDING_REVIEW and
+    only becomes SENT (buyer-visible) once an admin relays it. RETURNED means
+    the admin bounced it back to the supplier for changes.
+    """
+
     DRAFT = "draft"
+    PENDING_REVIEW = "pending_review"
+    RETURNED = "returned"
     SENT = "sent"
     ACCEPTED = "accepted"
     DECLINED = "declined"
+
+
+class PaymentProofType(str, enum.Enum):
+    """Kind of payment an admin-recorded proof of payment covers."""
+
+    DOWN_PAYMENT = "down_payment"
+    PROGRESS_PAYMENT = "progress_payment"
+    FINAL_PAYMENT = "final_payment"
+    REFUND = "refund"
+    OTHER = "other"
+
+
+PAYMENT_PROOF_TYPE_LABELS: dict[str, str] = {
+    PaymentProofType.DOWN_PAYMENT.value: "Down payment",
+    PaymentProofType.PROGRESS_PAYMENT.value: "Progressive payment",
+    PaymentProofType.FINAL_PAYMENT.value: "Payment completion",
+    PaymentProofType.REFUND.value: "Refund",
+    PaymentProofType.OTHER.value: "Payment",
+}
 
 
 class OrderStatus(str, enum.Enum):

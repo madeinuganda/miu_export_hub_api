@@ -133,6 +133,7 @@ class NavBadgesService:
         new_rfqs = 0
         rfq_pending_threads = 0
         deal_pending_threads = 0
+        quotes_awaiting_review = 0
 
         for rfq in rfqs:
             routed = await AdminService._rfq_assigned(db, rfq.id)
@@ -142,19 +143,16 @@ class NavBadgesService:
             if admin_status == "new":
                 new_rfqs += 1
 
-            quote = (
-                await db.execute(
-                    select(RfqQuote)
-                    .where(RfqQuote.rfq_id == rfq.id, RfqQuote.deleted_at.is_(None))
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
+            quote = await RfqService.latest_quote(db, rfq.id)
             order = (
                 await db.execute(
                     select(Order).where(Order.rfq_id == rfq.id, Order.deleted_at.is_(None)).limit(1)
                 )
             ).scalar_one_or_none()
             has_deal = quote is not None or order is not None
+
+            if quote is not None and quote.status == QuoteStatus.PENDING_REVIEW:
+                quotes_awaiting_review += 1
 
             if pending > 0:
                 if has_deal:
@@ -183,7 +181,8 @@ class NavBadgesService:
 
         orders = await NavBadgesService._admin_escrow_release_count(db)
         rfq_queue = new_rfqs + rfq_pending_threads
-        deal_relay = deal_pending_threads
+        # A quote sitting in review is work only an admin can clear.
+        deal_relay = deal_pending_threads + quotes_awaiting_review
         verification = verification_pending
         buyers = buyers_pending
         unread_count = rfq_queue + deal_relay + verification + buyers + orders

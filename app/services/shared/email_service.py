@@ -1,33 +1,97 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 from app.core.shared.config import get_settings
 from app.services.shared.notifications.email_delivery import EmailDeliveryService
+from app.services.shared.notifications.email_templates import (
+    Bullets,
+    Button,
+    Callout,
+    Details,
+    EmailAttachment,
+    EmailBlock,
+    Paragraph,
+    render_email,
+)
 
 logger = logging.getLogger(__name__)
 
 
+async def _deliver(
+    *,
+    to_email: str,
+    subject: str,
+    heading: str,
+    greeting: str | None = None,
+    preheader: str | None = None,
+    eyebrow: str | None = None,
+    blocks: Sequence[EmailBlock],
+    attachments: Sequence[EmailAttachment] | None = None,
+    fallback_label: str,
+) -> None:
+    """Render and send a branded email, logging (never raising) on failure."""
+
+    content = render_email(
+        subject=subject,
+        heading=heading,
+        greeting=greeting,
+        preheader=preheader,
+        eyebrow=eyebrow,
+        blocks=blocks,
+    )
+    try:
+        await EmailDeliveryService.send(
+            to=to_email,
+            subject=content.subject,
+            body=content.text,
+            html_body=content.html,
+            attachments=attachments,
+        )
+    except Exception:
+        logger.exception("Failed to send %s email to %s", fallback_label, to_email)
+        if get_settings().environment == "development":
+            print(f"\n[MIU] {fallback_label} email for {to_email}\n{content.text}\n")
+
+
+def _greeting(first_name: str | None) -> str:
+    name = (first_name or "").strip()
+    return f"Hi {name}," if name else "Hi there,"
+
+
 class EmailService:
     @staticmethod
-    async def send_buyer_activation_email(*, to_email: str, activation_url: str, first_name: str) -> None:
-        settings = get_settings()
-        subject = "Activate your MIU Export Hub buyer account"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"Thanks for registering on MIU Export Hub. "
-            f"Activate your account to access the buyer dashboard:\n\n"
-            f"{activation_url}\n\n"
-            f"This link expires in 48 hours.\n\n"
-            f"If you did not create an account, you can ignore this email.\n"
+    async def send_buyer_activation_email(
+        *, to_email: str, activation_url: str, first_name: str
+    ) -> None:
+        await _deliver(
+            to_email=to_email,
+            subject="Activate your MIU Export Hub buyer account",
+            heading="Activate your buyer account",
+            eyebrow="Welcome",
+            preheader="Confirm your email to start sourcing verified Ugandan suppliers.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    "Thanks for registering on MIU Export Hub. Confirm your email "
+                    "address to unlock your buyer dashboard and start sending RFQs "
+                    "to verified Ugandan suppliers."
+                ),
+                Button("Activate my account", activation_url),
+                Callout("This activation link expires in 48 hours.", tone="warning"),
+                Paragraph(
+                    "If the button does not work, copy this link into your browser:\n"
+                    f"{activation_url}",
+                    muted=True,
+                ),
+                Paragraph(
+                    "If you did not create this account, you can safely ignore this email.",
+                    muted=True,
+                ),
+            ],
+            fallback_label="Buyer activation",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send buyer activation email to %s", to_email)
-            if settings.environment == "development":
-                logger.info("Buyer activation link (fallback): %s", activation_url)
-                print(f"\n[MIU] Buyer activation link for {to_email}:\n{activation_url}\n")
 
     @staticmethod
     async def send_password_reset_email(
@@ -41,22 +105,37 @@ class EmailService:
         portal = {"buyer": "Buyer", "supplier": "Supplier", "admin": "Admin"}.get(
             account_type, "MIU"
         )
-        subject = f"Reset your MIU Export Hub {portal} password"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"We received a request to reset your {portal} portal password.\n\n"
-            f"Set a new password using this link:\n\n"
-            f"{reset_url}\n\n"
-            f"This link expires in {settings.password_reset_ttl_hours} hour(s).\n\n"
-            f"If you did not request this, you can ignore this email.\n"
+        hours = settings.password_reset_ttl_hours
+        await _deliver(
+            to_email=to_email,
+            subject=f"Reset your MIU Export Hub {portal} password",
+            heading="Reset your password",
+            eyebrow="Security",
+            preheader=f"Set a new password for your {portal} portal account.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    f"We received a request to reset the password for your {portal} "
+                    "portal account. Choose a new password using the button below."
+                ),
+                Button("Set a new password", reset_url),
+                Callout(
+                    f"This link expires in {hours} hour{'s' if hours != 1 else ''}.",
+                    tone="warning",
+                ),
+                Paragraph(
+                    "If the button does not work, copy this link into your browser:\n"
+                    f"{reset_url}",
+                    muted=True,
+                ),
+                Paragraph(
+                    "If you did not request a reset, ignore this email — your password "
+                    "stays unchanged.",
+                    muted=True,
+                ),
+            ],
+            fallback_label="Password reset",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send password reset email to %s", to_email)
-            if settings.environment == "development":
-                logger.info("Password reset link (fallback): %s", reset_url)
-                print(f"\n[MIU] Password reset for {to_email}:\n{reset_url}\n")
 
     @staticmethod
     async def send_supplier_onboarding_submitted_email(
@@ -67,25 +146,27 @@ class EmailService:
     ) -> None:
         settings = get_settings()
         dashboard_url = f"{settings.frontend_base_url.rstrip('/')}/dashboard/supplier"
-        subject = "Welcome to MIU Export Hub — your application is under review"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"Welcome to MIU Export Hub! Thank you for registering {company_name}.\n\n"
-            f"We have received your account information and uploaded documents. "
-            f"The MIU verification team is now reviewing your application. "
-            f"This typically takes up to 48 hours.\n\n"
-            f"You can sign in anytime to check your status:\n"
-            f"{dashboard_url}\n\n"
-            f"We will email you as soon as your verification is complete.\n\n"
-            f"Welcome aboard,\n"
-            f"The MIU Export Hub Team\n"
+        await _deliver(
+            to_email=to_email,
+            subject="Welcome to MIU Export Hub — your application is under review",
+            heading="Your application is under review",
+            eyebrow="Application received",
+            preheader=f"We received the verification documents for {company_name}.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    f"Thank you for registering {company_name} on MIU Export Hub. We "
+                    "have received your account information and uploaded documents."
+                ),
+                Paragraph(
+                    "The MIU verification team is now reviewing your application. This "
+                    "typically takes up to 48 hours, and we will email you as soon as "
+                    "the review is complete."
+                ),
+                Button("Check your status", dashboard_url),
+            ],
+            fallback_label="Supplier onboarding",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send supplier onboarding email to %s", to_email)
-            if settings.environment == "development":
-                print(f"\n[MIU] Supplier onboarding email for {to_email} ({company_name})\n")
 
     @staticmethod
     async def send_supplier_verified_email(
@@ -96,23 +177,35 @@ class EmailService:
     ) -> None:
         settings = get_settings()
         dashboard_url = f"{settings.frontend_base_url.rstrip('/')}/dashboard/supplier"
-        subject = "Welcome — your MIU Export Hub supplier account is verified"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"Welcome to MIU Export Hub! {company_name} has been verified by the MIU team.\n\n"
-            f"You now have full access to the supplier dashboard: list products, "
-            f"receive RFQs from international buyers, manage orders, and publish your storefront.\n\n"
-            f"Get started here:\n"
-            f"{dashboard_url}\n\n"
-            f"We're glad to have you in the MIU verified supplier network.\n\n"
-            f"The MIU Export Hub Team\n"
+        await _deliver(
+            to_email=to_email,
+            subject="Welcome — your MIU Export Hub supplier account is verified",
+            heading=f"{company_name} is verified",
+            eyebrow="Verified supplier",
+            preheader="You now have full access to the supplier dashboard.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    f"{company_name} has been verified by the MIU team. You now have "
+                    "full access to the supplier dashboard."
+                ),
+                Bullets(
+                    title="What you can do now",
+                    items=[
+                        "List products and submit them for publishing",
+                        "Receive RFQs from international buyers",
+                        "Quote, negotiate and manage orders end to end",
+                        "Publish your public storefront",
+                    ],
+                ),
+                Button("Go to my dashboard", dashboard_url),
+                Paragraph(
+                    "We're glad to have you in the MIU verified supplier network.",
+                    muted=True,
+                ),
+            ],
+            fallback_label="Supplier verified",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send supplier verified email to %s", to_email)
-            if settings.environment == "development":
-                print(f"\n[MIU] Supplier verified/welcome email for {to_email} ({company_name})\n")
 
     @staticmethod
     async def send_supplier_new_rfq_email(
@@ -125,30 +218,183 @@ class EmailService:
         destination: str | None,
         note: str | None,
         rfq_url: str,
+        attachments: Sequence[EmailAttachment] | None = None,
     ) -> None:
-        dest = (destination or "").strip() or "—"
-        note_block = ""
+        blocks: list[EmailBlock] = [
+            Paragraph("You have a new request for quotation on MIU Export Hub."),
+            Details(
+                title="RFQ summary",
+                rows=[
+                    ("Reference", rfq_public_id),
+                    ("Product", product_name),
+                    ("Quantity", quantity_label),
+                    ("Destination", destination or "—"),
+                ],
+            ),
+        ]
         if note and note.strip():
-            note_block = f"\nNote from MIU:\n{note.strip()}\n"
-        subject = f"New RFQ {rfq_public_id} — MIU Export Hub"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"You have a new request for quotation on MIU Export Hub.\n\n"
-            f"RFQ: {rfq_public_id}\n"
-            f"Product: {product_name}\n"
-            f"Quantity: {quantity_label}\n"
-            f"Destination: {dest}\n"
-            f"{note_block}\n"
-            f"Review and respond here:\n"
-            f"{rfq_url}\n\n"
-            f"The MIU Export Hub Team\n"
+            blocks.append(Callout(note.strip(), title="Note from MIU"))
+        blocks.append(Button("Review and quote", rfq_url))
+        if attachments:
+            blocks.append(
+                Paragraph(
+                    "The full RFQ is attached to this email as a PDF.", muted=True
+                )
+            )
+        await _deliver(
+            to_email=to_email,
+            subject=f"New RFQ {rfq_public_id} — MIU Export Hub",
+            heading=f"New RFQ · {rfq_public_id}",
+            eyebrow="Request for quotation",
+            preheader=f"{product_name} — {quantity_label}",
+            greeting=_greeting(first_name),
+            blocks=blocks,
+            attachments=attachments,
+            fallback_label="New RFQ",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send new RFQ email to %s", to_email)
-            if get_settings().environment == "development":
-                print(f"\n[MIU] New RFQ email for {to_email}: {rfq_public_id}\n{rfq_url}\n")
+
+    @staticmethod
+    async def send_buyer_rfq_submitted_email(
+        *,
+        to_email: str,
+        first_name: str,
+        rfq_public_id: str,
+        product_name: str,
+        quantity_label: str,
+        supplier_name: str | None,
+        rfq_url: str,
+        attachments: Sequence[EmailAttachment] | None = None,
+    ) -> None:
+        await _deliver(
+            to_email=to_email,
+            subject=f"RFQ {rfq_public_id} submitted — MIU Export Hub",
+            heading="We received your request",
+            eyebrow="RFQ submitted",
+            preheader=f"{product_name} — {quantity_label}",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    "Your request for quotation is with the MIU trade desk. We route it "
+                    "to the supplier and review their response before it reaches you."
+                ),
+                Details(
+                    title="RFQ summary",
+                    rows=[
+                        ("Reference", rfq_public_id),
+                        ("Product", product_name),
+                        ("Quantity", quantity_label),
+                        ("Supplier", supplier_name or "Matching in progress"),
+                    ],
+                ),
+                Button("Track this RFQ", rfq_url),
+            ],
+            attachments=attachments,
+            fallback_label="Buyer RFQ submitted",
+        )
+
+    @staticmethod
+    async def send_supplier_quote_submitted_email(
+        *,
+        to_email: str,
+        first_name: str,
+        rfq_public_id: str,
+        product_name: str,
+        offered_price: str,
+        rfq_url: str,
+        attachments: Sequence[EmailAttachment] | None = None,
+    ) -> None:
+        await _deliver(
+            to_email=to_email,
+            subject=f"Quote submitted for {rfq_public_id} — pending MIU review",
+            heading="Your quote is with the MIU trade desk",
+            eyebrow="Quote submitted",
+            preheader="We review every quote before it reaches the buyer.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    "Thanks for responding. The MIU trade desk reviews every quote "
+                    "before releasing it to the buyer — you will be notified once it "
+                    "has been sent on."
+                ),
+                Details(
+                    title="Quote summary",
+                    rows=[
+                        ("RFQ", rfq_public_id),
+                        ("Product", product_name),
+                        ("Offered price", offered_price),
+                        ("Status", "Pending MIU review"),
+                    ],
+                ),
+                Button("View the RFQ", rfq_url),
+            ],
+            attachments=attachments,
+            fallback_label="Quote submitted",
+        )
+
+    @staticmethod
+    async def send_supplier_quote_relayed_email(
+        *,
+        to_email: str,
+        first_name: str,
+        rfq_public_id: str,
+        product_name: str,
+        offered_price: str,
+        rfq_url: str,
+    ) -> None:
+        await _deliver(
+            to_email=to_email,
+            subject=f"Quote for {rfq_public_id} released to the buyer",
+            heading="Your quote has been sent to the buyer",
+            eyebrow="Quote released",
+            preheader="MIU has reviewed and forwarded your quote.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    "The MIU trade desk has reviewed your quote and released it to the "
+                    "buyer. We will let you know as soon as they respond."
+                ),
+                Details(
+                    rows=[
+                        ("RFQ", rfq_public_id),
+                        ("Product", product_name),
+                        ("Offered price", offered_price),
+                    ],
+                ),
+                Button("View the RFQ", rfq_url),
+            ],
+            fallback_label="Quote relayed",
+        )
+
+    @staticmethod
+    async def send_supplier_quote_returned_email(
+        *,
+        to_email: str,
+        first_name: str,
+        rfq_public_id: str,
+        product_name: str,
+        remarks: str,
+        rfq_url: str,
+    ) -> None:
+        await _deliver(
+            to_email=to_email,
+            subject=f"Quote for {rfq_public_id} needs changes",
+            heading="Your quote needs an update",
+            eyebrow="Action required",
+            preheader="The MIU trade desk returned your quote with remarks.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    "The MIU trade desk reviewed your quote and returned it before "
+                    "sending it to the buyer."
+                ),
+                Callout(remarks, title="Remarks from MIU", tone="warning"),
+                Details(
+                    rows=[("RFQ", rfq_public_id), ("Product", product_name)],
+                ),
+                Button("Update my quote", rfq_url),
+            ],
+            fallback_label="Quote returned",
+        )
 
     @staticmethod
     async def send_buyer_quote_received_email(
@@ -160,28 +406,39 @@ class EmailService:
         offered_price: str,
         notes: str | None,
         rfq_url: str,
+        attachments: Sequence[EmailAttachment] | None = None,
     ) -> None:
-        notes_block = ""
+        blocks: list[EmailBlock] = [
+            Paragraph(
+                "A quote reviewed by the MIU trade desk is ready for your RFQ."
+            ),
+            Details(
+                title="Quote summary",
+                rows=[
+                    ("RFQ", rfq_public_id),
+                    ("Product", product_name),
+                    ("Offered price", offered_price),
+                ],
+            ),
+        ]
         if notes and notes.strip():
-            notes_block = f"\nSupplier notes:\n{notes.strip()}\n"
-        subject = f"Quote received for {rfq_public_id} — MIU Export Hub"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"A quote is ready for your RFQ on MIU Export Hub.\n\n"
-            f"RFQ: {rfq_public_id}\n"
-            f"Product: {product_name}\n"
-            f"Offered price: {offered_price}\n"
-            f"{notes_block}\n"
-            f"Review the quote and accept or decline here:\n"
-            f"{rfq_url}\n\n"
-            f"The MIU Export Hub Team\n"
+            blocks.append(Callout(notes.strip(), title="Supplier notes"))
+        blocks.append(Button("Review and accept", rfq_url))
+        if attachments:
+            blocks.append(
+                Paragraph("The full quotation is attached as a PDF.", muted=True)
+            )
+        await _deliver(
+            to_email=to_email,
+            subject=f"Quote received for {rfq_public_id} — MIU Export Hub",
+            heading="Your quote is ready",
+            eyebrow="Quote received",
+            preheader=f"{product_name} — {offered_price}",
+            greeting=_greeting(first_name),
+            blocks=blocks,
+            attachments=attachments,
+            fallback_label="Quote received",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send quote-received email to %s", to_email)
-            if get_settings().environment == "development":
-                print(f"\n[MIU] Quote email for {to_email}: {rfq_public_id}\n{rfq_url}\n")
 
     @staticmethod
     async def send_supplier_quote_accepted_email(
@@ -194,26 +451,132 @@ class EmailService:
         quantity_label: str,
         offered_price: str,
         order_url: str,
+        attachments: Sequence[EmailAttachment] | None = None,
     ) -> None:
-        subject = f"Quote accepted — {rfq_public_id} → {order_public_id}"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"Great news — a buyer has accepted your quote on MIU Export Hub.\n\n"
-            f"RFQ: {rfq_public_id}\n"
-            f"Order: {order_public_id}\n"
-            f"Product: {product_name}\n"
-            f"Quantity: {quantity_label}\n"
-            f"Accepted price: {offered_price}\n\n"
-            f"View the order and next steps here:\n"
-            f"{order_url}\n\n"
-            f"The MIU Export Hub Team\n"
+        await _deliver(
+            to_email=to_email,
+            subject=f"Quote accepted — {rfq_public_id} → {order_public_id}",
+            heading="Your quote was accepted",
+            eyebrow="Order created",
+            preheader=f"{order_public_id} is now open.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    "Great news — the buyer accepted your quote and an order has been "
+                    "opened on MIU Export Hub."
+                ),
+                Details(
+                    title="Order summary",
+                    rows=[
+                        ("Order", order_public_id),
+                        ("RFQ", rfq_public_id),
+                        ("Product", product_name),
+                        ("Quantity", quantity_label),
+                        ("Accepted price", offered_price),
+                    ],
+                ),
+                Button("View the order", order_url),
+            ],
+            attachments=attachments,
+            fallback_label="Quote accepted",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send quote-accepted email to %s", to_email)
-            if get_settings().environment == "development":
-                print(f"\n[MIU] Quote accepted email for {to_email}: {order_public_id}\n")
+
+    @staticmethod
+    async def send_buyer_order_created_email(
+        *,
+        to_email: str,
+        first_name: str,
+        order_public_id: str,
+        product_name: str,
+        quantity_label: str,
+        total_value: str,
+        order_url: str,
+        attachments: Sequence[EmailAttachment] | None = None,
+    ) -> None:
+        blocks: list[EmailBlock] = [
+            Paragraph(
+                "Your order is confirmed. MIU holds your payment in escrow and "
+                "releases it to the supplier against agreed milestones."
+            ),
+            Details(
+                title="Order summary",
+                rows=[
+                    ("Order", order_public_id),
+                    ("Product", product_name),
+                    ("Quantity", quantity_label),
+                    ("Total value", total_value),
+                ],
+            ),
+            Button("Track my order", order_url),
+        ]
+        if attachments:
+            blocks.append(
+                Paragraph("Your order confirmation is attached as a PDF.", muted=True)
+            )
+        await _deliver(
+            to_email=to_email,
+            subject=f"Order {order_public_id} confirmed — MIU Export Hub",
+            heading=f"Order {order_public_id} confirmed",
+            eyebrow="Order confirmed",
+            preheader=f"{product_name} — {total_value}",
+            greeting=_greeting(first_name),
+            blocks=blocks,
+            attachments=attachments,
+            fallback_label="Order created",
+        )
+
+    @staticmethod
+    async def send_payment_proof_email(
+        *,
+        to_email: str,
+        first_name: str,
+        order_public_id: str,
+        payment_type_label: str,
+        amount: str,
+        reference: str | None,
+        paid_at: str | None,
+        method: str | None,
+        note: str | None,
+        order_url: str,
+        attachments: Sequence[EmailAttachment] | None = None,
+    ) -> None:
+        blocks: list[EmailBlock] = [
+            Paragraph(
+                f"The MIU trade desk has recorded a {payment_type_label.lower()} on "
+                f"order {order_public_id}."
+            ),
+            Details(
+                title="Payment details",
+                rows=[
+                    ("Order", order_public_id),
+                    ("Payment", payment_type_label),
+                    ("Amount", amount),
+                    ("Method", method or "—"),
+                    ("Reference", reference or "—"),
+                    ("Date", paid_at or "—"),
+                ],
+            ),
+        ]
+        if note and note.strip():
+            blocks.append(Callout(note.strip(), title="Note from MIU"))
+        blocks.append(Button("View the order", order_url))
+        if attachments:
+            blocks.append(
+                Paragraph(
+                    "The proof of payment is attached to this email.", muted=True
+                )
+            )
+        await _deliver(
+            to_email=to_email,
+            subject=f"{payment_type_label} recorded for {order_public_id}",
+            heading=f"{payment_type_label} recorded",
+            eyebrow="Proof of payment",
+            preheader=f"{amount} on {order_public_id}",
+            greeting=_greeting(first_name),
+            blocks=blocks,
+            attachments=attachments,
+            fallback_label="Payment proof",
+        )
 
     @staticmethod
     async def send_supplier_quote_declined_email(
@@ -225,24 +588,29 @@ class EmailService:
         offered_price: str | None,
         rfq_url: str,
     ) -> None:
-        price_line = f"Offered price: {offered_price}\n" if offered_price else ""
-        subject = f"Quote declined — {rfq_public_id}"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"A buyer has declined the quote for RFQ {rfq_public_id} on MIU Export Hub.\n\n"
-            f"RFQ: {rfq_public_id}\n"
-            f"Product: {product_name}\n"
-            f"{price_line}\n"
-            f"You can review the thread here:\n"
-            f"{rfq_url}\n\n"
-            f"The MIU Export Hub Team\n"
+        await _deliver(
+            to_email=to_email,
+            subject=f"Quote declined — {rfq_public_id}",
+            heading="A buyer declined your quote",
+            eyebrow="Quote declined",
+            preheader=f"RFQ {rfq_public_id} was declined.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    f"The buyer has declined the quote for RFQ {rfq_public_id}. The "
+                    "thread stays open in your dashboard if you would like to follow up."
+                ),
+                Details(
+                    rows=[
+                        ("RFQ", rfq_public_id),
+                        ("Product", product_name),
+                        ("Offered price", offered_price),
+                    ],
+                ),
+                Button("Review the thread", rfq_url),
+            ],
+            fallback_label="Quote declined",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send quote-declined email to %s", to_email)
-            if get_settings().environment == "development":
-                print(f"\n[MIU] Quote declined email for {to_email}: {rfq_public_id}\n")
 
     @staticmethod
     async def send_deal_message_email(
@@ -257,22 +625,20 @@ class EmailService:
         preview_text = (preview or "").strip()
         if len(preview_text) > 280:
             preview_text = preview_text[:277] + "..."
-        subject = f"New message on {thread_label} — MIU Export Hub"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"You have a new message from {sender_label} on {thread_label}.\n\n"
-            f"Message:\n"
-            f"{preview_text or '(no text)'}\n\n"
-            f"Open your messages:\n"
-            f"{messages_url}\n\n"
-            f"The MIU Export Hub Team\n"
+        await _deliver(
+            to_email=to_email,
+            subject=f"New message on {thread_label} — MIU Export Hub",
+            heading="You have a new message",
+            eyebrow=thread_label,
+            preheader=preview_text or "Open your messages on MIU Export Hub.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(f"{sender_label} sent you a message on {thread_label}."),
+                Callout(preview_text or "(no text)", title="Message"),
+                Button("Open messages", messages_url),
+            ],
+            fallback_label="Deal message",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send deal message email to %s", to_email)
-            if get_settings().environment == "development":
-                print(f"\n[MIU] Deal message email for {to_email} on {thread_label}\n")
 
     @staticmethod
     async def send_supplier_action_required_email(
@@ -285,25 +651,110 @@ class EmailService:
     ) -> None:
         settings = get_settings()
         dashboard_url = f"{settings.frontend_base_url.rstrip('/')}/dashboard/supplier"
-        items = "\n".join(f"  - {item}" for item in missing_items) or "  - Additional documentation"
-        subject = "Action required — update your MIU Export Hub application"
-        body = (
-            f"Hi {first_name},\n\n"
-            f"The MIU verification team needs updates for {company_name}.\n\n"
-            f"{message}\n\n"
-            f"Items that require your attention:\n"
-            f"{items}\n\n"
-            f"Please sign in and update the flagged items:\n"
-            f"{dashboard_url}\n\n"
-            f"Once you resubmit, we will review your updates promptly.\n\n"
-            f"The MIU Export Hub Team\n"
+        await _deliver(
+            to_email=to_email,
+            subject="Action required — update your MIU Export Hub application",
+            heading="We need a few updates",
+            eyebrow="Action required",
+            preheader=f"The verification team needs updates for {company_name}.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    f"The MIU verification team needs updates for {company_name} "
+                    "before your application can be approved."
+                ),
+                Callout(message, title="Reviewer notes", tone="warning"),
+                Bullets(
+                    title="Items that need your attention",
+                    items=missing_items or ["Additional documentation"],
+                ),
+                Button("Update my application", dashboard_url),
+                Paragraph(
+                    "Once you resubmit, we will review your updates promptly.",
+                    muted=True,
+                ),
+            ],
+            fallback_label="Supplier action required",
         )
-        try:
-            await EmailDeliveryService.send(to=to_email, subject=subject, body=body)
-        except Exception:
-            logger.exception("Failed to send supplier action-required email to %s", to_email)
-            if settings.environment == "development":
-                print(
-                    f"\n[MIU] Supplier action-required email for {to_email}\n"
-                    f"Items:\n{items}\n"
-                )
+
+    @staticmethod
+    async def send_product_submitted_email(
+        *,
+        to_email: str,
+        first_name: str,
+        product_name: str,
+        product_url: str,
+    ) -> None:
+        await _deliver(
+            to_email=to_email,
+            subject=f"{product_name} submitted for review",
+            heading="Your listing is under review",
+            eyebrow="Product submitted",
+            preheader="MIU reviews every listing before it goes live.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    f"“{product_name}” has been submitted to the MIU catalogue team. "
+                    "We check product details and photos before a listing goes live to "
+                    "buyers, which usually takes under 24 hours."
+                ),
+                Button("View my listing", product_url),
+            ],
+            fallback_label="Product submitted",
+        )
+
+    @staticmethod
+    async def send_product_approved_email(
+        *,
+        to_email: str,
+        first_name: str,
+        product_name: str,
+        product_url: str,
+    ) -> None:
+        await _deliver(
+            to_email=to_email,
+            subject=f"{product_name} is live on MIU Export Hub",
+            heading="Your listing is published",
+            eyebrow="Approved",
+            preheader=f"“{product_name}” is now visible to buyers.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    f"“{product_name}” has been approved by the MIU catalogue team and "
+                    "is now visible to buyers on the marketplace."
+                ),
+                Button("View my listing", product_url),
+            ],
+            fallback_label="Product approved",
+        )
+
+    @staticmethod
+    async def send_product_rejected_email(
+        *,
+        to_email: str,
+        first_name: str,
+        product_name: str,
+        reason: str,
+        product_url: str,
+    ) -> None:
+        await _deliver(
+            to_email=to_email,
+            subject=f"{product_name} needs changes before publishing",
+            heading="Your listing needs changes",
+            eyebrow="Action required",
+            preheader="The catalogue team sent feedback on your listing.",
+            greeting=_greeting(first_name),
+            blocks=[
+                Paragraph(
+                    f"The MIU catalogue team reviewed “{product_name}” and it is not "
+                    "ready to publish yet."
+                ),
+                Callout(reason, title="What needs to change", tone="warning"),
+                Paragraph(
+                    "Update the listing and submit it again — we will re-review it "
+                    "promptly."
+                ),
+                Button("Edit my listing", product_url),
+            ],
+            fallback_label="Product rejected",
+        )

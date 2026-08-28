@@ -217,11 +217,20 @@ class EmailService:
         quantity_label: str,
         destination: str | None,
         note: str | None,
+        routed_by_name: str | None = None,
+        routed_by_email: str | None = None,
         rfq_url: str,
         attachments: Sequence[EmailAttachment] | None = None,
     ) -> None:
+        routed_rows: list[tuple[str, str | None]] = []
+        if routed_by_name:
+            routed_rows.append(("Routed by", routed_by_name))
+        if routed_by_email:
+            routed_rows.append(("Contact", routed_by_email))
         blocks: list[EmailBlock] = [
-            Paragraph("You have a new request for quotation on MIU Export Hub."),
+            Paragraph(
+                "The MIU Export Hub trade desk routed a new request for quotation to you."
+            ),
             Details(
                 title="RFQ summary",
                 rows=[
@@ -229,11 +238,12 @@ class EmailService:
                     ("Product", product_name),
                     ("Quantity", quantity_label),
                     ("Destination", destination or "—"),
+                    *routed_rows,
                 ],
             ),
         ]
         if note and note.strip():
-            blocks.append(Callout(note.strip(), title="Note from MIU"))
+            blocks.append(Callout(note.strip(), title="Message from MIU trade desk"))
         blocks.append(Button("Review and quote", rfq_url))
         if attachments:
             blocks.append(
@@ -405,9 +415,13 @@ class EmailService:
         product_name: str,
         offered_price: str,
         notes: str | None,
+        relayed_by_name: str | None = None,
         rfq_url: str,
         attachments: Sequence[EmailAttachment] | None = None,
     ) -> None:
+        relay_rows: list[tuple[str, str | None]] = []
+        if relayed_by_name:
+            relay_rows.append(("Relayed by", relayed_by_name))
         blocks: list[EmailBlock] = [
             Paragraph(
                 "A quote reviewed by the MIU trade desk is ready for your RFQ."
@@ -418,11 +432,12 @@ class EmailService:
                     ("RFQ", rfq_public_id),
                     ("Product", product_name),
                     ("Offered price", offered_price),
+                    *relay_rows,
                 ],
             ),
         ]
         if notes and notes.strip():
-            blocks.append(Callout(notes.strip(), title="Supplier notes"))
+            blocks.append(Callout(notes.strip(), title="Notes from MIU trade desk"))
         blocks.append(Button("Review and accept", rfq_url))
         if attachments:
             blocks.append(

@@ -10,14 +10,16 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from io import BytesIO
 from typing import Sequence
 
 from app.core.shared.config import get_settings
+from app.services.shared.branding import PRIMARY_RGB, logo_bytes
 from app.services.shared.notifications.email_templates import EmailAttachment
 
 logger = logging.getLogger(__name__)
 
-TEAL = (0, 97, 97)
+NAVY = PRIMARY_RGB
 GREEN = (0, 170, 109)
 HEADING = (51, 66, 87)
 BODY = (95, 107, 116)
@@ -151,7 +153,7 @@ def render_document_pdf(spec: DocumentSpec) -> bytes | None:
 
     def section_title(text: str) -> None:
         pdf.set_font("Helvetica", "B", 10)
-        pdf.set_text_color(*TEAL)
+        pdf.set_text_color(*NAVY)
         pdf.cell(
             width, 7, _latin(text.upper()), new_x=XPos.LMARGIN, new_y=YPos.NEXT
         )
@@ -160,19 +162,30 @@ def render_document_pdf(spec: DocumentSpec) -> bytes | None:
         line_break(2)
 
     # Header band
-    pdf.set_fill_color(*TEAL)
+    pdf.set_fill_color(*NAVY)
     pdf.rect(0, 0, pdf.w, 26, style="F")
-    pdf.set_xy(pdf.l_margin, 8)
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.set_text_color(255, 255, 255)
-    pdf.cell(width / 2, 8, "Made in Uganda")
+    logo_data = logo_bytes()
+    logo_rendered = False
+    if logo_data:
+        try:
+            pdf.image(BytesIO(logo_data), x=pdf.l_margin, y=5, w=34)
+            logo_rendered = True
+        except Exception:  # pragma: no cover - fpdf image decode edge cases
+            logo_rendered = False
+    if not logo_rendered:
+        pdf.set_xy(pdf.l_margin, 8)
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(width / 2, 8, "Made in Uganda")
     pdf.set_font("Helvetica", "", 9)
     pdf.set_xy(pdf.l_margin + width / 2, 9)
+    pdf.set_text_color(255, 255, 255)
     pdf.cell(width / 2, 7, _latin(site_url), align="R")
-    pdf.set_xy(pdf.l_margin, 15)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(210, 232, 230)
-    pdf.cell(width, 6, "Export Hub", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if not logo_rendered:
+        pdf.set_xy(pdf.l_margin, 15)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(210, 210, 220)
+        pdf.cell(width, 6, "Export Hub", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.set_y(34)
     pdf.set_font("Helvetica", "B", 19)
@@ -329,16 +342,18 @@ def rfq_document(
     incoterm: str | None,
     needed_by: str | None,
     requirements: str | None,
+    parties: Sequence[DocumentParty] | None = None,
+    intro: str | None = None,
 ) -> EmailAttachment | None:
     spec = DocumentSpec(
         title="Request for Quotation",
         reference=reference,
         issued_on=issued_on,
-        intro=(
+        intro=intro or (
             "This request for quotation was raised on MIU Export Hub. Please respond "
             "through the platform so the MIU trade desk can review and route your quote."
         ),
-        parties=[
+        parties=list(parties) if parties is not None else [
             DocumentParty("Buyer", buyer_lines),
             DocumentParty("Supplier", supplier_lines),
         ],
@@ -376,16 +391,17 @@ def quotation_document(
     lead_time: str | None,
     shipment_terms: str | None,
     notes: str | None,
+    parties: Sequence[DocumentParty] | None = None,
+    intro: str | None = None,
+    notes_title: str = "Supplier notes",
 ) -> EmailAttachment | None:
     spec = DocumentSpec(
         title="Quotation",
         reference=quote_reference,
         issued_on=issued_on,
         status="Reviewed by MIU trade desk",
-        intro=(
-            f"Quotation issued in response to RFQ {reference} on MIU Export Hub."
-        ),
-        parties=[
+        intro=intro or f"Quotation issued in response to RFQ {reference} on MIU Export Hub.",
+        parties=list(parties) if parties is not None else [
             DocumentParty("Quoted to", buyer_lines),
             DocumentParty("Quoted by", supplier_lines),
         ],
@@ -409,7 +425,7 @@ def quotation_document(
             )
         ],
         totals=[("Total", total_price)],
-        notes=[("Supplier notes", notes or "")],
+        notes=[(notes_title, notes or "")],
         footer_note=(
             "Acceptance of this quotation on MIU Export Hub creates an escrowed order. "
             "Prices are exclusive of duties and taxes unless stated otherwise."

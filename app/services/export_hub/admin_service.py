@@ -454,7 +454,7 @@ class AdminService:
         apply_create_audit(log, admin.id)
         db.add(log)
         await db.flush()
-        await RfqService.notify_supplier_new_rfq(db, rfq, note=data.note)
+        await RfqService.notify_supplier_new_rfq(db, rfq, note=data.note, routed_by_admin=admin)
         return {"ok": True, "public_id": rfq.public_id, "status": "routed"}
 
     @staticmethod
@@ -704,6 +704,7 @@ class AdminService:
     async def route_message(db: AsyncSession, admin: AdminAccount, public_id: str, message_id: UUID, note: str | None) -> dict:
         rfq = await AdminService._resolve_rfq_by_public_id(db, public_id)
         msg = await RfqService.route_message(db, admin.id, rfq.id, message_id, note)
+        admin_label = RfqService._admin_sender_label(admin)
         # After routing, the counterparty can see it for the first time.
         if msg.sender_role == SenderRole.BUYER:
             await AdminService._notify_deal_message_recipients(
@@ -712,7 +713,7 @@ class AdminService:
                 msg,
                 notify_buyer=False,
                 notify_supplier=True,
-                sender_label="Buyer (via MIU Admin)",
+                sender_label=admin_label,
             )
         elif msg.sender_role == SenderRole.SUPPLIER:
             await AdminService._notify_deal_message_recipients(
@@ -721,7 +722,7 @@ class AdminService:
                 msg,
                 notify_buyer=True,
                 notify_supplier=False,
-                sender_label="Supplier (via MIU Admin)",
+                sender_label=admin_label,
             )
         return RfqService._serialize_message(msg, admin_view=True)
 
@@ -1559,6 +1560,7 @@ class AdminService:
                     SupplierOrganization.verification_status.in_(
                         (
                             VerificationStatus.PENDING.value,
+                            VerificationStatus.ACTION_REQUIRED.value,
                             VerificationStatus.APPROVED.value,
                             VerificationStatus.REJECTED.value,
                             VerificationStatus.SUSPENDED.value,
@@ -1579,6 +1581,8 @@ class AdminService:
                 continue
             if status == "rejected" and app.status != "rejected":
                 continue
+            if status == "suspended" and app.status != "suspended":
+                continue
             if status == "processed" and app.status in ("pending", "action_required"):
                 continue
             if app.status in ("pending", "action_required"):
@@ -1592,6 +1596,7 @@ class AdminService:
             "pending": len([a for a in combined if a.status in ("pending", "action_required")]),
             "approved": len([a for a in combined if a.status == "approved"]),
             "rejected": len([a for a in combined if a.status == "rejected"]),
+            "suspended": len([a for a in combined if a.status == "suspended"]),
         }
         pending_slice = [a for a in paged.items if a.status in ("pending", "action_required")]
         processed_slice = [a for a in paged.items if a.status not in ("pending", "action_required")]
@@ -1752,8 +1757,15 @@ class AdminService:
         org = await db.get(SupplierOrganization, application_id)
         if not org or org.deleted_at:
             raise AppError(404, "Application not found", "not_found")
-        if org.verification_status != VerificationStatus.SUSPENDED:
-            raise AppError(400, "Only suspended suppliers can be restored", "invalid_status")
+        if org.verification_status not in (
+            VerificationStatus.SUSPENDED,
+            VerificationStatus.REJECTED,
+        ):
+            raise AppError(
+                400,
+                "Only suspended or rejected suppliers can be restored",
+                "invalid_status",
+            )
 
         org.verification_status = VerificationStatus.APPROVED
         org.storefront_published = True
@@ -2142,6 +2154,8 @@ class AdminService:
                 continue
             if status == "rejected" and item.status != "rejected":
                 continue
+            if status == "suspended" and item.status != "suspended":
+                continue
             if status == "processed" and item.status in ("pending", "action_required"):
                 continue
             if item.status in ("pending", "action_required"):
@@ -2155,6 +2169,7 @@ class AdminService:
             "pending": len([a for a in combined if a.status in ("pending", "action_required")]),
             "approved": len([a for a in combined if a.status == "approved"]),
             "rejected": len([a for a in combined if a.status == "rejected"]),
+            "suspended": len([a for a in combined if a.status == "suspended"]),
         }
         pending_slice = [a for a in paged.items if a.status in ("pending", "action_required")]
         processed_slice = [a for a in paged.items if a.status not in ("pending", "action_required")]
@@ -2279,8 +2294,15 @@ class AdminService:
         org = await db.get(BuyerOrganization, org_id)
         if not org or org.deleted_at:
             raise AppError(404, "Buyer not found", "not_found")
-        if org.onboarding_status != VerificationStatus.SUSPENDED:
-            raise AppError(400, "Only suspended buyers can be restored", "invalid_status")
+        if org.onboarding_status not in (
+            VerificationStatus.SUSPENDED,
+            VerificationStatus.REJECTED,
+        ):
+            raise AppError(
+                400,
+                "Only suspended or rejected buyers can be restored",
+                "invalid_status",
+            )
 
         org.onboarding_status = VerificationStatus.APPROVED
         org.verified_buyer = True

@@ -7,13 +7,16 @@ payment services all produce consistent documents.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.export_hub.accounts import BuyerAccount, SupplierAccount
+from app.core.shared.config import get_settings
+from app.models.export_hub.accounts import AdminAccount, BuyerAccount, SupplierAccount
 from app.models.export_hub.catalog import Product
+from app.models.export_hub.misc import AdminActionLog
 from app.models.export_hub.orders import Order, OrderPaymentProof
 from app.models.export_hub.organizations import (
     BuyerOrganization,
@@ -25,6 +28,7 @@ from app.models.export_hub.payments import PaymentEscrow
 from app.models.export_hub.rfqs import Rfq, RfqQuote
 from app.models.shared.enums import PAYMENT_PROOF_TYPE_LABELS
 from app.services.shared.document_service import (
+    DocumentParty,
     format_doc_date,
     order_document,
     payment_receipt_document,
@@ -35,6 +39,8 @@ from app.services.shared.notifications.email_templates import EmailAttachment
 from app.utils.formatting import format_money, format_quantity
 
 logger = logging.getLogger(__name__)
+
+Audience = Literal["admin", "supplier", "buyer"]
 
 
 def payment_type_label(payment_type: str) -> str:
@@ -92,8 +98,60 @@ async def _supplier_party_lines(db: AsyncSession, org_id: UUID) -> list[str]:
     return lines or ["Supplier"]
 
 
-async def build_rfq_attachment(db: AsyncSession, rfq: Rfq) -> EmailAttachment | None:
+async def _admin_party_lines(db: AsyncSession, admin_id: UUID | None) -> list[str]:
+    if admin_id:
+        admin = await db.get(AdminAccount, admin_id)
+        if admin:
+            name = f"{admin.first_name} {admin.last_name}".strip()
+            lines = [name or "MIU Trade Desk"]
+            if admin.email:
+                lines.append(admin.email)
+            lines.append("MIU Export Hub Trade Desk")
+            return lines
+    settings = get_settings()
+    return [
+        "MIU Export Hub Trade Desk",
+        settings.mail_from_email or "info@madeinuganda.co.ug",
+    ]
+
+
+async def _rfq_routed_by_admin_id(db: AsyncSession, rfq_id: UUID) -> UUID | None:
+    log = (
+        await db.execute(
+            select(AdminActionLog)
+            .where(
+                AdminActionLog.action == "assign_rfq",
+                AdminActionLog.entity_type == "rfq",
+                AdminActionLog.entity_id == rfq_id,
+                AdminActionLog.deleted_at.is_(None),
+            )
+            .order_by(AdminActionLog.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return log.admin_account_id if log else None
+
+
+async def build_rfq_attachment(
+    db: AsyncSession,
+    rfq: Rfq,
+    *,
+    audience: Audience | None = None,
+    routed_by_admin_id: UUID | None = None,
+) -> EmailAttachment | None:
     product = await db.get(Product, rfq.product_id)
+    admin_id = routed_by_admin_id or (
+        await _rfq_routed_by_admin_id(db, rfq.id) if audience == "supplier" else None
+    )
+    parties: list[DocumentParty] | None = None
+    intro: str | None = None
+    if audience == "supplier":
+        parties = [DocumentParty("Routed by", await _admin_party_lines(db, admin_id))]
+        intro = (
+            "This request for quotation was routed to you by the MIU Export Hub trade desk. "
+            "Please respond through the platform so we can review and relay your quote."
+        )
+
     return rfq_document(
         reference=rfq.public_id,
         issued_on=format_doc_date(rfq.sent_at or rfq.created_at),
@@ -110,15 +168,37 @@ async def build_rfq_attachment(db: AsyncSession, rfq: Rfq) -> EmailAttachment | 
         incoterm=rfq.incoterm,
         needed_by=format_doc_date(rfq.required_by_date) if rfq.required_by_date else None,
         requirements=rfq.message,
+        parties=parties,
+        intro=intro,
     )
 
 
 async def build_quote_attachment(
-    db: AsyncSession, rfq: Rfq, quote: RfqQuote
+    db: AsyncSession,
+    rfq: Rfq,
+    quote: RfqQuote,
+    *,
+    audience: Audience | None = None,
+    relayed_by_admin_id: UUID | None = None,
 ) -> EmailAttachment | None:
     product = await db.get(Product, rfq.product_id)
     total = quote.unit_price * rfq.quantity
     suffix = rfq.public_id.replace("RFQ-", "", 1)
+    parties: list[DocumentParty] | None = None
+    intro: str | None = None
+    notes_title = "Supplier notes"
+    if audience == "buyer":
+        admin_id = relayed_by_admin_id or quote.reviewed_by
+        parties = [
+            DocumentParty("Quoted to", await _buyer_party_lines(db, rfq.buyer_org_id)),
+            DocumentParty("Relayed by", await _admin_party_lines(db, admin_id)),
+        ]
+        intro = (
+            f"This quotation for RFQ {rfq.public_id} was reviewed and relayed to you "
+            "by the MIU Export Hub trade desk."
+        )
+        notes_title = "Notes from MIU trade desk"
+
     return quotation_document(
         reference=rfq.public_id,
         quote_reference=f"QTN-{suffix}",
@@ -134,6 +214,9 @@ async def build_quote_attachment(
         lead_time=f"{quote.lead_time_days} days" if quote.lead_time_days else None,
         shipment_terms=quote.shipment_terms,
         notes=quote.notes,
+        parties=parties,
+        intro=intro,
+        notes_title=notes_title,
     )
 
 

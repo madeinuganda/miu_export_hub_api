@@ -104,6 +104,10 @@ class ScopedDocuments:
 
         kind = doc_kind.replace(".pdf", "").strip().lower()
         if kind == "rfq":
+            if supplier_org_id:
+                return _pdf_response(
+                    await build_rfq_attachment(db, rfq, audience="supplier")
+                )
             return _pdf_response(await build_rfq_attachment(db, rfq))
         if kind in ("quote", "quotation"):
             if buyer_org_id:
@@ -113,8 +117,16 @@ class ScopedDocuments:
                 quote = await RfqService.buyer_visible_quote(db, rfq.id)
                 if not quote:
                     raise AppError(404, "No quote available yet", "not_found")
-            else:
-                quote = await _latest_quote(db, rfq.id)
+                return _pdf_response(
+                    await build_quote_attachment(
+                        db,
+                        rfq,
+                        quote,
+                        audience="buyer",
+                        relayed_by_admin_id=quote.reviewed_by,
+                    )
+                )
+            quote = await _latest_quote(db, rfq.id)
             return _pdf_response(await build_quote_attachment(db, rfq, quote))
         raise AppError(404, "Unknown document type", "not_found")
 

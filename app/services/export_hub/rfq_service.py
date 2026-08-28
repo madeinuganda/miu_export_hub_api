@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.shared.config import get_settings
 from app.core.shared.exceptions import AppError
-from app.models.export_hub.accounts import BuyerAccount, SupplierAccount
+from app.models.export_hub.accounts import BuyerAccount, SupplierAccount, AdminAccount
 from app.models.export_hub.catalog import Product
 from app.models.shared.enums import MessageReviewStatus, ProductStatus, QuoteStatus, RfqStatus, SenderRole
 from app.models.export_hub.organizations import (
@@ -119,7 +119,6 @@ class RfqService:
         await db.flush()
         if data.message and data.message.strip():
             await RfqService.add_message(db, rfq.id, SenderRole.BUYER, data.message.strip(), user_id)
-        await RfqService.notify_supplier_new_rfq(db, rfq)
         await RfqService.notify_buyer_rfq_submitted(db, rfq)
         return rfq
 
@@ -170,11 +169,17 @@ class RfqService:
         # against legacy rows so the buyer never sees "responded" with no quote.
         if status == "responded" and quote is None:
             status = "awaiting"
+        relayed_by_name: str | None = None
+        if quote:
+            admin = await db.get(AdminAccount, quote.reviewed_by) if quote.reviewed_by else None
+            relayed_by_name = RfqService._admin_sender_label(admin)
+        supplier_display = relayed_by_name or (supplier.name if supplier else "via MIU")
         return {
             "id": rfq.public_id,
             "status": status,
             "productName": product.name if product else "",
-            "supplierName": supplier.name if supplier else "via MIU",
+            "supplierName": supplier_display,
+            "relayedBy": relayed_by_name,
             "quantity": format_quantity(rfq.quantity, rfq.unit),
             "targetPrice": format_ugx(rfq.target_price_amount or 0, rfq.unit) if rfq.target_price_amount else "",
             "sentDate": rfq.sent_at.date().isoformat() if rfq.sent_at else "",
@@ -240,12 +245,11 @@ class RfqService:
             if status_filter and status_filter != "all" and st != status_filter:
                 continue
             product = await db.get(Product, rfq.product_id)
-            buyer = await db.get(BuyerOrganization, rfq.buyer_org_id)
             items.append(
                 {
                     "id": rfq.public_id,
                     "product": product.name if product else "",
-                    "route": f"via MIU Admin · {buyer.country if buyer else 'International'}",
+                    "route": "via MIU Export Hub",
                     "quantity": format_quantity(rfq.quantity, rfq.unit),
                     "time": format_relative_time(rfq.sent_at),
                     "status": st,
@@ -365,11 +369,19 @@ class RfqService:
         return await db.get(BuyerAccount, member.buyer_account_id)
 
     @staticmethod
+    def _admin_sender_label(admin: AdminAccount | None) -> str:
+        if not admin:
+            return "MIU Export Hub Trade Desk"
+        name = f"{admin.first_name} {admin.last_name}".strip()
+        return f"{name} · MIU Export Hub" if name else "MIU Export Hub Trade Desk"
+
+    @staticmethod
     async def notify_supplier_new_rfq(
         db: AsyncSession,
         rfq: Rfq,
         *,
         note: str | None = None,
+        routed_by_admin: AdminAccount | None = None,
     ) -> None:
         account = await RfqService._primary_supplier_account(db, rfq.supplier_org_id)
         if not account or not account.email:
@@ -377,6 +389,8 @@ class RfqService:
         product = await db.get(Product, rfq.product_id)
         product_name = product.name if product else "Product"
         base = get_settings().frontend_base_url.rstrip("/")
+        routed_by_name = RfqService._admin_sender_label(routed_by_admin)
+        routed_by_email = routed_by_admin.email if routed_by_admin else None
         await EmailService.send_supplier_new_rfq_email(
             to_email=account.email,
             first_name=account.first_name or "there",
@@ -385,8 +399,17 @@ class RfqService:
             quantity_label=format_quantity(rfq.quantity, rfq.unit),
             destination=rfq.destination_port,
             note=note,
+            routed_by_name=routed_by_name,
+            routed_by_email=routed_by_email,
             rfq_url=f"{base}/dashboard/supplier/rfq?id={rfq.public_id}",
-            attachments=_only(await build_rfq_attachment(db, rfq)),
+            attachments=_only(
+                await build_rfq_attachment(
+                    db,
+                    rfq,
+                    audience="supplier",
+                    routed_by_admin_id=routed_by_admin.id if routed_by_admin else None,
+                )
+            ),
         )
 
     @staticmethod
@@ -423,8 +446,19 @@ class RfqService:
             product_name=product_name,
             offered_price=format_ugx(quote.unit_price, rfq.unit),
             notes=quote.notes,
+            relayed_by_name=RfqService._admin_sender_label(
+                await db.get(AdminAccount, quote.reviewed_by) if quote.reviewed_by else None
+            ),
             rfq_url=f"{base}/dashboard/buyer/rfqs?id={rfq.public_id}",
-            attachments=_only(await build_quote_attachment(db, rfq, quote)),
+            attachments=_only(
+                await build_quote_attachment(
+                    db,
+                    rfq,
+                    quote,
+                    audience="buyer",
+                    relayed_by_admin_id=quote.reviewed_by,
+                )
+            ),
         )
 
     @staticmethod
@@ -641,6 +675,28 @@ class RfqService:
         ).scalars().all()
 
     @staticmethod
+    async def _serialize_message_for_viewer(
+        db: AsyncSession,
+        m: RfqMessage,
+        viewer_role: SenderRole,
+        *,
+        admin_view: bool = False,
+    ) -> dict:
+        item = RfqService._serialize_message(m, admin_view=admin_view)
+        if admin_view:
+            return item
+        if (
+            m.review_status == MessageReviewStatus.ROUTED
+            and m.reviewed_by
+            and m.sender_role != viewer_role
+            and m.sender_role in (SenderRole.BUYER, SenderRole.SUPPLIER)
+        ):
+            admin = await db.get(AdminAccount, m.reviewed_by)
+            item["senderRole"] = SenderRole.ADMIN.value
+            item["senderLabel"] = RfqService._admin_sender_label(admin)
+        return item
+
+    @staticmethod
     async def list_messages_for_viewer(db: AsyncSession, rfq_id: UUID, viewer_role: SenderRole) -> list[dict]:
         """Messages visible to a buyer or supplier viewer: their own messages
         (any review status, so they can see 'pending review' / 'reverted'
@@ -666,7 +722,10 @@ class RfqService:
             elif viewer_role == SenderRole.BUYER:
                 rfq.buyer_messages_read_at = now
 
-        return [RfqService._serialize_message(m, admin_view=False) for m in visible]
+        return [
+            await RfqService._serialize_message_for_viewer(db, m, viewer_role)
+            for m in visible
+        ]
 
     @staticmethod
     async def list_messages_for_admin(db: AsyncSession, rfq_id: UUID) -> list[dict]:

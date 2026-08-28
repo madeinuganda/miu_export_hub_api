@@ -766,7 +766,7 @@ async def supplier_rfq_detail(public_id: str, db: AsyncSession = Depends(get_db)
         "targetPriceNum": float(rfq.target_price_amount or 0),
         "requiredBy": rfq.required_by_date.isoformat() if rfq.required_by_date else "",
         "certifications": [],
-        "marketRequirements": rfq.message or "",
+        "marketRequirements": "",
         "messages": await RfqService.list_messages_for_viewer(db, rfq.id, SenderRole.SUPPLIER),
     }
 

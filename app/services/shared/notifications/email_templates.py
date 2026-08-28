@@ -12,9 +12,14 @@ from html import escape
 from typing import Iterable, Sequence, Union
 
 from app.core.shared.config import get_settings
+from app.services.shared.branding import (
+    PRIMARY_DARK_HEX,
+    PRIMARY_HEX,
+    logo_data_uri,
+)
 
-TEAL = "#006161"
-TEAL_DARK = "#004a4a"
+PRIMARY = PRIMARY_HEX
+PRIMARY_DARK = PRIMARY_DARK_HEX
 GREEN = "#00AA6D"
 HEADING = "#334257"
 BODY = "#5f6b74"
@@ -29,7 +34,7 @@ FONT_STACK = (
 )
 
 TONE_COLORS = {
-    "info": (TEAL, "#effafa"),
+    "info": (PRIMARY, "#f0f0f4"),
     "success": (GREEN, "#eefaf4"),
     "warning": ("#b26a00", "#fff7e8"),
     "danger": ("#b3261e", "#fdeeed"),
@@ -186,7 +191,7 @@ def _html_callout(block: Callout) -> str:
 def _html_button(block: Button) -> str:
     return (
         f'<table role="presentation" cellpadding="0" cellspacing="0" '
-        f'style="margin:4px 0 26px;"><tr><td style="background:{GREEN};'
+        f'style="margin:4px 0 26px;"><tr><td style="background:{PRIMARY};'
         f'border-radius:8px;"><a href="{escape(block.url, quote=True)}" '
         f'style="display:inline-block;padding:13px 30px;color:#ffffff;'
         f'font-size:15px;font-weight:600;text-decoration:none;">'
@@ -276,6 +281,24 @@ def render_email(
             f"{escape(preheader)}</div>"
         )
 
+    logo_uri = logo_data_uri()
+    if logo_uri:
+        header_html = (
+            f'<tr><td style="background:{PRIMARY};padding:18px 32px;">'
+            f'<img src="{logo_uri}" alt="Made in Uganda Export Hub" height="44" '
+            f'style="display:block;border:0;max-width:220px;height:auto;" />'
+            f"</td></tr>"
+        )
+    else:
+        header_html = (
+            f'<tr><td style="background:{PRIMARY};padding:24px 32px;">'
+            f'<span style="color:#ffffff;font-size:17px;font-weight:700;letter-spacing:.3px;">'
+            f"Made in Uganda</span>"
+            f'<span style="color:rgba(255,255,255,.72);font-size:17px;font-weight:400;">'
+            f" &nbsp;|&nbsp; Export Hub</span>"
+            f"</td></tr>"
+        )
+
     html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -285,10 +308,7 @@ def render_email(
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{PAGE_BG};padding:28px 12px;">
 <tr><td align="center">
 <table role="presentation" width="550" cellpadding="0" cellspacing="0" style="width:550px;max-width:100%;background:{CARD_BG};border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(15,35,32,.08);">
-<tr><td style="background:{TEAL};padding:24px 32px;">
-<span style="color:#ffffff;font-size:17px;font-weight:700;letter-spacing:.3px;">Made in Uganda</span>
-<span style="color:rgba(255,255,255,.72);font-size:17px;font-weight:400;"> &nbsp;|&nbsp; Export Hub</span>
-</td></tr>
+{header_html}
 <tr><td style="padding:32px;">
 {eyebrow_html}
 <h1 style="margin:0 0 18px;color:{HEADING};font-size:22px;line-height:30px;font-weight:700;">{escape(heading)}</h1>
@@ -301,7 +321,7 @@ def render_email(
 You are receiving this because you have an account on MIU Export Hub.
 </p>
 <p style="margin:0;color:{MUTED};font-size:12px;line-height:19px;">
-<a href="{escape(site_url, quote=True)}" style="color:{TEAL_DARK};text-decoration:none;">{escape(site_url)}</a>
+<a href="{escape(site_url, quote=True)}" style="color:{PRIMARY_DARK};text-decoration:none;">{escape(site_url)}</a>
 &nbsp;·&nbsp; &copy; Made in Uganda
 </p>
 </td></tr>
